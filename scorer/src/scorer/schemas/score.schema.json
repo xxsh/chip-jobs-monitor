@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "score",
+    "suitability",
+    "recommendation",
+    "matchedReasons",
+    "gapReasons",
+    "verdict"
+  ],
+  "properties": {
+    "score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Overall fit score 0-100. 0=clearly wrong role, 50=ambiguous, 100=ideal match."
+    },
+    "suitability": {
+      "type": "string",
+      "enum": ["Strong fit", "Good fit", "Possible stretch", "Low fit"],
+      "description": "Bucketed verdict consistent with score band."
+    },
+    "recommendation": {
+      "type": "string",
+      "enum": ["Apply", "Maybe", "Skip"],
+      "description": "Action recommendation."
+    },
+    "matchedReasons": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "items": {"type": "string", "maxLength": 280},
+      "description": "Concrete reasons (citing the candidate's background) why the role is a fit."
+    },
+    "gapReasons": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "items": {"type": "string", "maxLength": 280},
+      "description": "Concrete missing/weak areas relative to the role."
+    },
+    "verdict": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "One-paragraph synthesis the candidate can read at a glance."
+    }
+  }
+}

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Shanghai Hiring Signal Board</title>
+    <link rel="stylesheet" href="/dashboard.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">Multi-company jobs monitor</p>
+          <h1>Shanghai hiring signal</h1>
+        </div>
+        <div class="status" id="status">Loading MySQL data</div>
+      </header>
+
+      <section class="metric-grid" id="metrics" aria-label="Trend summary"></section>
+      <section class="company-strip" id="companyStrip" aria-label="Company summary"></section>
+
+      <section class="dashboard-grid">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <h2>Tracked active jobs and daily movement</h2>
+            <span id="rangeLabel"></span>
+          </div>
+          <div id="activeChart" class="chart"></div>
+        </article>
+
+        <article class="panel panel-source">
+          <div class="panel-head">
+            <h2>Company coverage</h2>
+          </div>
+          <div id="sourceChart" class="source-chart"></div>
+        </article>
+
+        <article class="panel panel-fit">
+          <div class="panel-head">
+            <h2>Scored fit mix</h2>
+          </div>
+          <div id="fitChart" class="chart compact"></div>
+        </article>
+
+        <article class="panel panel-roles">
+          <div class="panel-head">
+            <h2>Top scored roles</h2>
+          </div>
+          <ol class="role-list" id="topRoles"></ol>
+        </article>
+
+        <article class="panel panel-adds">
+          <div class="panel-head">
+            <h2>Recent additions</h2>
+          </div>
+          <ul class="change-list" id="recentAdds"></ul>
+        </article>
+
+        <article class="panel panel-cancels">
+          <div class="panel-head">
+            <h2>Recent cancellations</h2>
+          </div>
+          <ul class="change-list muted" id="recentCancels"></ul>
+        </article>
+      </section>
+    </main>
+
+    <script type="module" src="/dashboard.js"></script>
+  </body>
+</html>

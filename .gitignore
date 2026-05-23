@@ -1,0 +1,19 @@
+# virtualenvs & deps (regenerable, ~180M)
+.venv/
+scorer/.venv/
+node_modules/
+
+# local env / secrets (keep .env.example tracked)
+.env
+
+# python / macOS junk
+__pycache__/
+*.pyc
+.DS_Store
+
+# generated data (disposable / grows daily)
+snapshots/
+reports/
+logs/
+*.log
+scorer/cache/

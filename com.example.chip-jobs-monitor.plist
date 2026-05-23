@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd template for the daily run. Copy to
+  ~/Library/LaunchAgents/com.example.chip-jobs-monitor.plist, replace every
+  {{REPO_DIR}} with the absolute path to this checkout, then:
+      launchctl load ~/Library/LaunchAgents/com.example.chip-jobs-monitor.plist
+  run-daily.sh resolves the interpreter, sets MySQL defaults, and strips proxy vars,
+  so it is the entry point here. On Linux use cron instead (see README).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.chip-jobs-monitor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{REPO_DIR}}/run-daily.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{REPO_DIR}}</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>{{REPO_DIR}}/logs/launchd.stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>{{REPO_DIR}}/logs/launchd.stderr.log</string>
+</dict>
+</plist>

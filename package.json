@@ -1,0 +1,22 @@
+{
+  "name": "chip-jobs-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "db:backfill": "node scripts/backfill-db.mjs",
+    "db:backfill-posted-dates": "node scripts/backfill-posted-dates.mjs",
+    "db:migrate": "node scripts/migrate-db.mjs",
+    "dashboard": "node scripts/dashboard-server.mjs",
+    "fetch:py": ".venv/bin/python fetch.py",
+    "fetch:verify": "python3 verify_fetch_render.py",
+    "db:verify": "python3 verify_db.py",
+    "daily:py": ".venv/bin/python daily.py",
+    "daily:test": "python3 -m unittest daily_test test_arm_source",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "mysql2": "^3.22.3",
+    "playwright": "^1.59.1"
+  }
+}

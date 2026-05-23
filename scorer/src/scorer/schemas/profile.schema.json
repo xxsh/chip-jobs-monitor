@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "level",
+    "yearsExperience",
+    "primaryDomains",
+    "coreSkills",
+    "secondarySkills",
+    "preferences",
+    "antiPreferences",
+    "headline"
+  ],
+  "properties": {
+    "level": {
+      "type": "string",
+      "enum": ["intern", "junior", "mid", "senior", "staff", "principal", "manager"],
+      "description": "Best-fit career level inferred from the resume."
+    },
+    "yearsExperience": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 50,
+      "description": "Approximate total years of professional experience."
+    },
+    "primaryDomains": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "items": {"type": "string"},
+      "description": "Domains where the candidate is strongest, e.g. 'semiconductor test', 'BI/data analytics'."
+    },
+    "coreSkills": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 20,
+      "items": {"type": "string"},
+      "description": "Concrete tools/technologies/methodologies the candidate clearly owns."
+    },
+    "secondarySkills": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string"},
+      "description": "Skills mentioned but not central."
+    },
+    "preferences": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string"},
+      "description": "Types of roles the candidate is well-suited for, in plain English."
+    },
+    "antiPreferences": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string"},
+      "description": "Types of roles that would be a poor fit (e.g. RTL/circuit design, intern)."
+    },
+    "headline": {
+      "type": "string",
+      "maxLength": 280,
+      "description": "One-sentence elevator pitch for the candidate."
+    }
+  }
+}

@@ -1,0 +1,1021 @@
+"""Daily NVIDIA jobs pipeline: fetch -> diff -> score -> render -> persist.
+
+Python port of the former daily.mjs (Phase 3 of the JS->Python migration; the
+Node entrypoint was deleted 2026-05-23). Collapses the two old subprocess seams:
+it imports the scorer (scorer.score) and the MySQL sidecar (db.py) in-process
+instead of spawning them.
+
+Pure functions (partition_diff, build_report, render_markdown,
+render_telegram_digest, ...) are importable and covered by daily_test.py.
+
+Known intentional difference from the original Node renderer: it sorted tied
+scores / canceled jobs with String.localeCompare (ICU collation). That isn't
+reproducible in stdlib Python, so ties use a casefold key here — display order
+of equally-scored or canceled jobs may differ slightly; all other output is
+identical.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+__dirname = os.path.dirname(os.path.abspath(__file__))
+
+LOCATION = os.environ.get("NVIDIA_LOCATION") or "Shanghai, China"
+SNAPSHOT_LABEL = os.environ.get("NVIDIA_SNAPSHOT_LABEL") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+SKIP_FETCH = os.environ.get("NVIDIA_SKIP_FETCH") == "1"
+SNAPSHOT_DIR = os.path.join(__dirname, "snapshots")
+REPORT_DIR = os.path.join(__dirname, "reports")
+SCORER_DIR = os.path.join(__dirname, "scorer")
+PROFILE_CACHE = os.path.join(SCORER_DIR, "cache", "profile_latest.json")
+SCORER_PYTHON = os.environ.get("SCORER_PYTHON") or os.path.join(SCORER_DIR, ".venv", "bin", "python")
+LOCK_DIR = os.path.join(__dirname, "logs", "daily.lock")
+RESUME_PATH = os.path.abspath(
+    os.path.join(__dirname, os.environ.get("RESUME_PATH") or "../resume.md")
+)
+
+
+def bounded_int(value, fallback, lo, hi):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = fallback
+    return max(lo, min(hi, n))
+
+
+SCORER_CONCURRENCY = max(1, min(3, bounded_int(os.environ.get("NVIDIA_SCORER_CONCURRENCY"), 3, 1, 3)))
+SCORER_JOB_TIMEOUT_SECONDS = bounded_int(os.environ.get("NVIDIA_SCORER_JOB_TIMEOUT_SECONDS"), 90, 15, 600)
+SCORER_ATTEMPTS = bounded_int(os.environ.get("NVIDIA_SCORER_ATTEMPTS"), 1, 1, 3)
+MAX_SCORING_JOBS_PER_RUN = bounded_int(os.environ.get("NVIDIA_MAX_SCORING_JOBS_PER_RUN"), 3, 0, 100)
+
+
+def resolve_scorer_codex_home():
+    if os.environ.get("NVIDIA_SCORER_CODEX_HOME"):
+        return os.environ["NVIDIA_SCORER_CODEX_HOME"]
+    user_names = [u for u in (os.environ.get("USER"), os.environ.get("LOGNAME")) if u]
+    candidates = []
+    if os.environ.get("HOME"):
+        candidates.append(os.path.join(os.environ["HOME"], ".codex"))
+    candidates.extend(os.path.join("/Users", u, ".codex") for u in user_names)
+    candidates.append(os.path.join(os.path.expanduser("~"), ".codex"))
+    for candidate in candidates:
+        if os.path.exists(os.path.join(candidate, "auth.json")):
+            return candidate
+    return os.path.join(os.path.expanduser("~"), ".codex")
+
+
+SCORER_CODEX_HOME = resolve_scorer_codex_home()
+
+
+# ---------------------------------------------------------------- helpers
+def slugify(value):
+    s = re.sub(r"[^a-z0-9]+", "-", value.lower())
+    return re.sub(r"^-|-$", "", s)
+
+
+def is_date_label(value):
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", value))
+
+
+def ensure_dir(directory):
+    os.makedirs(directory, exist_ok=True)
+
+
+def _title_key(value):
+    # Approximates JS String.localeCompare for tie-breaking (casefold, then raw).
+    s = "" if value is None else str(value)
+    return (s.casefold(), s)
+
+
+def process_is_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def acquire_run_lock():
+    ensure_dir(os.path.dirname(LOCK_DIR))
+    for _ in range(2):
+        try:
+            os.mkdir(LOCK_DIR)
+            with open(os.path.join(LOCK_DIR, "pid"), "w") as f:
+                f.write(f"{os.getpid()}\n")
+            with open(os.path.join(LOCK_DIR, "started_at"), "w") as f:
+                f.write(datetime.now(timezone.utc).isoformat() + "\n")
+
+            def release():
+                try:
+                    with open(os.path.join(LOCK_DIR, "pid")) as f:
+                        lock_pid = f.read().strip()
+                    if lock_pid == str(os.getpid()):
+                        _rmtree(LOCK_DIR)
+                except OSError:
+                    pass
+
+            return release
+        except FileExistsError:
+            pid = None
+            try:
+                with open(os.path.join(LOCK_DIR, "pid")) as f:
+                    pid = int(f.read().strip())
+            except (OSError, ValueError):
+                pid = None
+            if pid is not None and process_is_alive(pid):
+                raise RuntimeError(f"NVIDIA daily monitor is already running with pid {pid}")
+            _rmtree(LOCK_DIR)
+    raise RuntimeError(f"Could not acquire NVIDIA daily monitor lock at {LOCK_DIR}")
+
+
+def _rmtree(path):
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _source_infix(source):
+    # NVIDIA keeps the original {label}_{slug} naming (history continuity); other
+    # sources get a {label}_{source}_{slug} infix.
+    return "" if source in (None, "nvidia") else f"{source}_"
+
+
+def snapshot_filename(label, source=None):
+    return f"{label}_{_source_infix(source)}{slugify(LOCATION)}.json"
+
+
+def job_key(job):
+    if job.get("id") is not None:
+        return str(job["id"])
+    if job.get("jr") is not None:
+        return str(job["jr"])
+    name = job.get("name")
+    if name is None:
+        name = job.get("title")
+    if name is None:
+        name = ""
+    posted = job.get("postedTs")
+    if posted is None:
+        posted = job.get("datePosted")
+    if posted is None:
+        posted = job.get("posted")
+    if posted is None:
+        posted = ""
+    return f"{name}|{posted}"
+
+
+def _load_json(file):
+    import json
+
+    with open(file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def find_snapshot_by_label(label, source=None):
+    file = os.path.join(SNAPSHOT_DIR, snapshot_filename(label, source))
+    return file if os.path.exists(file) else None
+
+
+def list_dated_snapshot_files(current_label=None, source=None):
+    if current_label is None:
+        current_label = SNAPSHOT_LABEL
+    suffix = f"_{_source_infix(source)}{slugify(LOCATION)}.json"
+    if not os.path.exists(SNAPSHOT_DIR):
+        return []
+    entries = []
+    for file in os.listdir(SNAPSHOT_DIR):
+        if not file.endswith(suffix):
+            continue
+        label = file[: -len(suffix)]
+        if not is_date_label(label):
+            continue
+        if is_date_label(current_label) and label > current_label:
+            continue
+        entries.append({"label": label, "file": os.path.join(SNAPSHOT_DIR, file)})
+    entries.sort(key=lambda e: e["label"])
+    return entries
+
+
+def find_previous_snapshot(current_label, source=None):
+    files = [e for e in list_dated_snapshot_files(current_label, source) if e["label"] != current_label]
+    return files[-1]["file"] if files else None
+
+
+def load_snapshot(file):
+    return _load_json(file)
+
+
+def load_snapshot_history(current_label=None, source=None):
+    if current_label is None:
+        current_label = SNAPSHOT_LABEL
+    return [
+        {"label": e["label"], "file": e["file"], "jobs": load_snapshot(e["file"])}
+        for e in list_dated_snapshot_files(current_label, source)
+    ]
+
+
+def load_dated_reports(current_label=None, source=None):
+    if current_label is None:
+        current_label = SNAPSHOT_LABEL
+    slug = slugify(LOCATION)
+    pattern = re.compile(rf"^(\d{{4}}-\d{{2}}-\d{{2}})_{re.escape(_source_infix(source))}{slug}\.json$")
+    if not os.path.exists(REPORT_DIR):
+        return []
+    entries = []
+    for file in os.listdir(REPORT_DIR):
+        match = pattern.match(file)
+        if not match:
+            continue
+        label = match.group(1)
+        if is_date_label(current_label) and label > current_label:
+            continue
+        full_path = os.path.join(REPORT_DIR, file)
+        try:
+            entries.append({"label": label, "file": full_path, "report": _load_json(full_path)})
+        except (OSError, ValueError):
+            continue
+    entries.sort(key=lambda e: e["label"])
+    return entries
+
+
+def load_profile_highlights():
+    if not os.path.exists(PROFILE_CACHE):
+        return []
+    try:
+        data = _load_json(PROFILE_CACHE)
+        profile = data.get("profile") if isinstance(data, dict) and "profile" in data else data
+        domains = profile.get("primaryDomains")
+        return domains if isinstance(domains, list) else []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def partition_diff(current_jobs, previous_jobs):
+    previous_ids = {job_key(job) for job in previous_jobs}
+    current_ids = {job_key(job) for job in current_jobs}
+    new_jobs = [job for job in current_jobs if job_key(job) not in previous_ids]
+    canceled = [
+        {"jr": job.get("jr"), "title": job.get("name")}
+        for job in previous_jobs
+        if job_key(job) not in current_ids
+    ]
+    canceled.sort(key=lambda c: _title_key(c["title"]))
+    return {"newJobs": new_jobs, "canceledJobs": canceled}
+
+
+def is_intern_job(job):
+    text = " ".join(
+        str(x)
+        for x in (
+            job.get("name"),
+            job.get("title"),
+        )
+        if x
+    )
+    return bool(re.search(r"\b(intern|internship)\b", text, re.I)) or "实习" in text
+
+
+def build_skipped_intern_score(job):
+    title = job.get("name") or job.get("title") or "(unknown)"
+    return {
+        "jr": job.get("jr"),
+        "id": job.get("id"),
+        "title": title,
+        "link": job.get("link"),
+        "locations": job.get("locations"),
+        "department": job.get("department"),
+        "posted": job.get("datePosted") or job.get("postedTs"),
+        "score": 0,
+        "suitability": "Low fit",
+        "recommendation": "Skip",
+        "matchedReasons": [],
+        "gapReasons": [
+            "Internship roles are skipped because the experience level is too far below the target profile."
+        ],
+        "verdict": "Skipped automatically: internship-level role.",
+        "skippedReason": "intern",
+        "firstSeenDate": job.get("firstSeenDate"),
+    }
+
+
+def ensure_profile_cache():
+    if not os.path.exists(PROFILE_CACHE):
+        raise RuntimeError(
+            f"Profile cache not found at {PROFILE_CACHE}.\n"
+            "Run once before the first scoring:\n"
+            f"  cd {SCORER_DIR}\n"
+            f'  PYTHONPATH=src .venv/bin/python -m scorer.profile --resume "{RESUME_PATH}"'
+        )
+
+
+def run_scorer(jobs):
+    """In-process scorer: replaces the old `python -m scorer.score` subprocess.
+
+    Mirrors scorer/score.py main(): per-job codex call, bounded concurrency,
+    identifying fields carried forward, original order preserved.
+    """
+    if not jobs:
+        return []
+    ensure_profile_cache()
+
+    scorer_src = os.path.join(SCORER_DIR, "src")
+    if scorer_src not in sys.path:
+        sys.path.insert(0, scorer_src)
+    os.environ["CODEX_HOME"] = SCORER_CODEX_HOME
+    from scorer.score import load_profile, score_job  # noqa: E402
+
+    profile = load_profile(Path(PROFILE_CACHE))
+    timeout = SCORER_JOB_TIMEOUT_SECONDS
+    attempts = SCORER_ATTEMPTS
+    concurrency = max(1, min(3, SCORER_CONCURRENCY, len(jobs) or 1))
+
+    def score_one(index, job):
+        title = job.get("name") or job.get("title") or "(unknown)"
+        jr = job.get("jr") or "(unknown)"
+        print(f"  [{index + 1}/{len(jobs)}] scoring {jr} — {title}", file=sys.stderr, flush=True)
+        result = score_job(job, profile, timeout=timeout, attempts=attempts)
+        return index, {
+            "jr": job.get("jr"),
+            "id": job.get("id"),
+            "title": title,
+            "link": job.get("link"),
+            "locations": job.get("locations"),
+            "department": job.get("department"),
+            "posted": job.get("datePosted") or job.get("postedTs"),
+            **result,
+        }
+
+    slots = [None] * len(jobs)
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(score_one, i, job) for i, job in enumerate(jobs)]
+        for future in as_completed(futures):
+            index, merged = future.result()
+            slots[index] = merged
+            jr = merged.get("jr") or "(unknown)"
+            print(f"  [{index + 1}/{len(jobs)}] done {jr}", file=sys.stderr, flush=True)
+    return slots
+
+
+def summarize_fits(jobs):
+    summary = {"strongFit": 0, "goodFit": 0, "possibleStretch": 0, "lowFit": 0}
+    for job in jobs:
+        suitability = job.get("suitability")
+        if suitability == "Strong fit":
+            summary["strongFit"] += 1
+        elif suitability == "Good fit":
+            summary["goodFit"] += 1
+        elif suitability == "Possible stretch":
+            summary["possibleStretch"] += 1
+        else:
+            summary["lowFit"] += 1
+    return summary
+
+
+def sort_scored(jobs):
+    return sorted(jobs, key=lambda j: (-(j.get("score") or 0), _title_key(j.get("title"))))
+
+
+def build_first_seen_by_key(snapshot_history):
+    first_seen = {}
+    if not isinstance(snapshot_history, list) or len(snapshot_history) < 2:
+        return first_seen
+    previous_jobs = snapshot_history[0].get("jobs") or []
+    for entry in snapshot_history[1:]:
+        previous_keys = {job_key(job) for job in previous_jobs}
+        for job in entry.get("jobs") or []:
+            key = job_key(job)
+            if key not in previous_keys and key not in first_seen:
+                first_seen[key] = entry["label"]
+        previous_jobs = entry.get("jobs") or []
+    return first_seen
+
+
+def collect_successful_score_keys(report_entries):
+    successful = set()
+    for entry in report_entries or []:
+        report = entry.get("report") if isinstance(entry, dict) and "report" in entry else entry
+        scored_jobs = []
+        if isinstance(report.get("rankedJobs"), list):
+            scored_jobs.extend(report["rankedJobs"])
+        if isinstance(report.get("newJobs"), list):
+            scored_jobs.extend(report["newJobs"])
+        for scored in scored_jobs:
+            if not scored or scored.get("error"):
+                continue
+            successful.add(job_key(scored))
+    return successful
+
+
+def attach_scoring_dates(scored_jobs, source_jobs):
+    source_by_key = {job_key(job): job for job in source_jobs}
+    out = []
+    for index, scored in enumerate(scored_jobs):
+        source = source_by_key.get(job_key(scored))
+        if source is None and index < len(source_jobs):
+            source = source_jobs[index]
+        first_seen = scored.get("firstSeenDate")
+        if first_seen is None:
+            first_seen = source.get("firstSeenDate") if source else None
+        # {**scored, "firstSeenDate": ...} keeps the key in place if present, else appends — matches JS spread.
+        out.append({**scored, "firstSeenDate": first_seen})
+    return out
+
+
+def render_markdown(report):
+    md = f"# NVIDIA daily jobs — {report['date']}\n\n"
+    md += f"- Jobs today: {report['currentJobCount']}\n"
+    md += f"- Added: {report['addedCount']}\n"
+    md += f"- Scored now: {report['rankedJobCount']}\n"
+    if report.get("backlogCount"):
+        md += f"- Backfilled: {report['backlogCount']}\n"
+    if report.get("deferredScoreCount"):
+        md += f"- Deferred unscored: {report['deferredScoreCount']}"
+        if report.get("deferredDates"):
+            md += f" ({', '.join(report['deferredDates'])})"
+        md += "\n"
+    if report.get("scoreErrorCount"):
+        md += f"- Scoring errors to retry: {report['scoreErrorCount']}\n"
+    md += f"- Canceled: {report['canceledCount']}\n"
+
+    if report["profileHighlights"]:
+        md += f"- Profile: {', '.join(report['profileHighlights'])}\n"
+
+    if report.get("baselineCreated"):
+        md += "\nBaseline established today. Scoring of newly added jobs starts from the next dated run.\n"
+        return md
+
+    if not report["rankedJobs"]:
+        md += (
+            f"\nNo jobs scored in this run; {report['deferredScoreCount']} active unscored jobs remain queued.\n"
+            if report.get("deferredScoreCount")
+            else "\nNo newly added NVIDIA jobs today.\n"
+        )
+        if report["canceledJobs"]:
+            md += "\n## Canceled\n"
+            for j in report["canceledJobs"]:
+                md += f"- [{j['jr']}] {j['title']}\n"
+        return md
+
+    md += f"- Strong fit: {report['fitSummary']['strongFit']}\n"
+    md += f"- Good fit: {report['fitSummary']['goodFit']}\n"
+    md += f"- Possible stretch: {report['fitSummary']['possibleStretch']}\n"
+    md += f"- Low fit: {report['fitSummary']['lowFit']}\n"
+
+    md += "\n## Jobs Ranked For You\n"
+    for index, job in enumerate(report["rankedJobs"]):
+        md += f"\n### {index + 1}. [{job['jr']}] {job['title']}\n"
+        md += f"- Fit: {job['suitability']} ({job['score']})\n"
+        md += f"- Action: {job['recommendation']}\n"
+        if job.get("firstSeenDate"):
+            md += f"- Added: {job['firstSeenDate']}\n"
+        md += f"- Posted: {job.get('posted') if job.get('posted') is not None else ''}\n"
+        md += f"- Locations: {'; '.join(job.get('locations') or [])}\n"
+        md += f"- Link: {job['link']}\n"
+        if job.get("verdict"):
+            md += f"- Verdict: {job['verdict']}\n"
+        if job.get("matchedReasons"):
+            md += "- Matches:\n"
+            for r in job["matchedReasons"]:
+                md += f"  - {r}\n"
+        if job.get("gapReasons"):
+            md += "- Gaps:\n"
+            for r in job["gapReasons"]:
+                md += f"  - {r}\n"
+        if job.get("error"):
+            md += f"- Note: scoring error — {job['error']}\n"
+
+    if report["canceledJobs"]:
+        md += "\n## Canceled\n"
+        for j in report["canceledJobs"]:
+            md += f"- [{j['jr']}] {j['title']}\n"
+
+    return md
+
+
+TELEGRAM_LIMIT = 4096
+TELEGRAM_BUDGET = 3800
+TELEGRAM_PER_COMPANY = 6  # max actionable jobs shown per company in the grouped digest
+
+
+def _u16len(s):
+    # Length in UTF-16 code units, matching JS String.length (and Telegram's limit).
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _u16slice(s, n):
+    # First n UTF-16 code units, matching JS String.prototype.slice(0, n).
+    return s.encode("utf-16-le")[: n * 2].decode("utf-16-le", errors="ignore")
+
+
+def first_sentence(text, max_len=220):
+    if not text:
+        return ""
+    m = re.match(r"[\s\S]*?[.!?。！？](?=\s|$)", str(text))
+    s = (m.group(0) if m else str(text)).strip()
+    return _u16slice(s, max_len - 1).rstrip() + "…" if _u16len(s) > max_len else s
+
+
+def fit_icon(suitability):
+    return {"Strong fit": "🟢", "Good fit": "🟡", "Possible stretch": "🟠", "Low fit": "⚪️"}.get(
+        suitability, "⚪️"
+    )
+
+
+def render_telegram_digest(report):
+    lines = []
+    ranked_job_count = report.get("rankedJobCount", len(report["rankedJobs"]))
+    backlog_count = report.get("backlogCount") or 0
+    deferred_score_count = report.get("deferredScoreCount") or 0
+    lines.append(f"🦀 NVIDIA {report['location']} — {report['date']}")
+    lines.append(
+        f"{report['currentJobCount']} active · +{report['addedCount']} added today · "
+        f"{ranked_job_count} scored"
+        f"{f' ({backlog_count} backfill)' if backlog_count else ''}"
+        f"{f' · {deferred_score_count} queued' if deferred_score_count else ''} · "
+        f"-{report['canceledCount']} canceled"
+    )
+
+    if report.get("baselineCreated"):
+        lines.append("")
+        lines.append("Baseline established. New-job tracking starts tomorrow.")
+        return "\n".join(lines)
+
+    if not report["rankedJobs"]:
+        lines.append("")
+        if deferred_score_count:
+            lines.append(
+                f"No jobs scored in this run; {deferred_score_count} active unscored jobs remain queued."
+            )
+        else:
+            lines.append("No new jobs today.")
+        if report["canceledJobs"]:
+            lines.append("")
+            lines.append(f"❌ Canceled ({len(report['canceledJobs'])}):")
+            for c in report["canceledJobs"][:10]:
+                lines.append(f"• [{c['jr']}] {c['title']}")
+        return "\n".join(lines)
+
+    f = report["fitSummary"]
+    lines.append(
+        f"Fit: {f['strongFit']} strong / {f['goodFit']} good / {f['possibleStretch']} stretch / {f['lowFit']} low"
+    )
+    if deferred_score_count:
+        dates = f" from {', '.join(report['deferredDates'])}" if report.get("deferredDates") else ""
+        lines.append(f"Queued next: {deferred_score_count} unscored active job(s){dates}")
+    lines.append("")
+    lines.append(f"➕ SCORED ({ranked_job_count}) ranked by fit:")
+
+    actionable = [j for j in report["rankedJobs"] if j.get("recommendation") != "Skip"]
+    skip_pile = [j for j in report["rankedJobs"] if j.get("recommendation") == "Skip"]
+
+    body = {"text": "", "truncated": 0}
+
+    def try_append(chunk):
+        if _u16len("\n".join(lines)) + _u16len(body["text"]) + _u16len(chunk) + 1 > TELEGRAM_BUDGET:
+            body["truncated"] += 1
+            return False
+        body["text"] += chunk
+        return True
+
+    for i, j in enumerate(actionable):
+        head = f"\n\n{i + 1}. {fit_icon(j.get('suitability'))} [{j['jr']}] {j['title']}"
+        first_seen = f" · added {j['firstSeenDate']}" if j.get("firstSeenDate") else ""
+        meta = f"\n   {j['suitability']} ({j['score']}) · {j['recommendation']}{first_seen}"
+        verdict = f"\n   {first_sentence(j['verdict'], 220)}" if j.get("verdict") else ""
+        link = f"\n   {j['link']}"
+        if not try_append(head + meta + verdict + link):
+            continue
+
+    if skip_pile:
+        header = f"\n\n⚪️ Skip ({len(skip_pile)}):"
+        if try_append(header):
+            for j in skip_pile:
+                try_append(f"\n• [{j['jr']}] {j['title']}{f' · added {j['firstSeenDate']}' if j.get('firstSeenDate') else ''}")
+
+    if report["canceledJobs"]:
+        header = f"\n\n❌ Canceled ({len(report['canceledJobs'])}):"
+        if try_append(header):
+            for c in report["canceledJobs"][:8]:
+                try_append(f"\n• [{c['jr']}] {c['title']}")
+
+    if body["truncated"] > 0:
+        body["text"] += (
+            f"\n\n…{body['truncated']} item(s) trimmed; "
+            f"see latest_{slugify(report['location'])}.md for full report."
+        )
+
+    out = "\n".join(lines) + body["text"]
+    return _u16slice(out, TELEGRAM_LIMIT - 1) + "…" if _u16len(out) > TELEGRAM_LIMIT else out
+
+
+def build_report(
+    *,
+    current_jobs,
+    previous_jobs,
+    previous_snapshot_file,
+    snapshot_history=None,
+    successful_score_keys=None,
+    report_date=None,
+    max_scoring_jobs_per_run=None,
+    score_fn=run_scorer,
+    source=None,
+):
+    if report_date is None:
+        report_date = SNAPSHOT_LABEL
+    if max_scoring_jobs_per_run is None:
+        max_scoring_jobs_per_run = MAX_SCORING_JOBS_PER_RUN
+    profile_highlights = load_profile_highlights()
+
+    if not previous_snapshot_file:
+        return {
+            "date": report_date,
+            "location": LOCATION,
+            "resumePath": RESUME_PATH,
+            "currentSnapshot": snapshot_filename(report_date, source),
+            "previousSnapshot": None,
+            "baselineCreated": True,
+            "profileHighlights": profile_highlights,
+            "currentJobCount": len(current_jobs),
+            "addedCount": 0,
+            "canceledCount": 0,
+            "canceledJobs": [],
+            "fitSummary": summarize_fits([]),
+            "backlogCount": 0,
+            "deferredScoreCount": 0,
+            "scoreErrorCount": 0,
+            "remainingUnscoredCount": 0,
+            "scoredDates": [],
+            "deferredDates": [],
+            "rankedJobCount": 0,
+            "rankedJobs": [],
+            "newJobs": [],
+        }
+
+    diff = partition_diff(current_jobs, previous_jobs)
+    new_jobs, canceled_jobs = diff["newJobs"], diff["canceledJobs"]
+    first_seen_by_key = build_first_seen_by_key(snapshot_history) if snapshot_history else None
+    handled_score_keys = successful_score_keys if successful_score_keys is not None else set()
+    if first_seen_by_key is not None:
+        score_candidates = [
+            {**job, "firstSeenDate": first_seen_by_key.get(job_key(job))}
+            for job in current_jobs
+        ]
+        score_candidates = [
+            job for job in score_candidates if job["firstSeenDate"] and job_key(job) not in handled_score_keys
+        ]
+    else:
+        score_candidates = [{**job, "firstSeenDate": report_date} for job in new_jobs]
+
+    skipped_intern_jobs = [build_skipped_intern_score(job) for job in score_candidates if is_intern_job(job)]
+    model_score_candidates = [job for job in score_candidates if not is_intern_job(job)]
+    if max_scoring_jobs_per_run > 0:
+        jobs_to_score = model_score_candidates[:max_scoring_jobs_per_run]
+        deferred_jobs = model_score_candidates[max_scoring_jobs_per_run:]
+    else:
+        jobs_to_score = model_score_candidates
+        deferred_jobs = []
+
+    scored_by_model = attach_scoring_dates(score_fn(jobs_to_score), jobs_to_score)
+    scored = sort_scored([*scored_by_model, *skipped_intern_jobs])
+    backlog_count = len([j for j in scored if j.get("firstSeenDate") and j["firstSeenDate"] != report_date])
+    score_error_count = len([j for j in scored if j.get("error")])
+    scored_dates = sorted({j["firstSeenDate"] for j in scored if j.get("firstSeenDate")})
+    deferred_dates = sorted({j["firstSeenDate"] for j in deferred_jobs if j.get("firstSeenDate")})
+
+    return {
+        "date": report_date,
+        "location": LOCATION,
+        "resumePath": RESUME_PATH,
+        "currentSnapshot": snapshot_filename(report_date, source),
+        "previousSnapshot": os.path.basename(previous_snapshot_file),
+        "baselineCreated": False,
+        "profileHighlights": profile_highlights,
+        "currentJobCount": len(current_jobs),
+        "addedCount": len(new_jobs),
+        "canceledCount": len(canceled_jobs),
+        "canceledJobs": canceled_jobs,
+        "fitSummary": summarize_fits(scored),
+        "scoreCandidateCount": len(score_candidates),
+        "modelScoreCandidateCount": len(model_score_candidates),
+        "scoreLimit": max_scoring_jobs_per_run,
+        "backlogCount": backlog_count,
+        "deferredScoreCount": len(deferred_jobs),
+        "scoreErrorCount": score_error_count,
+        "remainingUnscoredCount": len(deferred_jobs) + score_error_count,
+        "scoredDates": scored_dates,
+        "deferredDates": deferred_dates,
+        "rankedJobCount": len(scored),
+        "rankedJobs": scored,
+        "newJobs": scored,
+    }
+
+
+def remove_latest_report_files():
+    if not is_date_label(SNAPSHOT_LABEL):
+        return
+    slug = slugify(LOCATION)
+    latest_base = os.path.join(REPORT_DIR, f"latest_{slug}")
+    for suffix in (".json", ".md", "_telegram.md"):
+        try:
+            os.remove(f"{latest_base}{suffix}")
+        except OSError:
+            pass
+
+
+def _write_json(path, obj):
+    import json
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def write_source_report(report, source):
+    """Per-source dated report ({label}_{infix}{slug}.json) — feeds score-dedup, DB archive, and grouping."""
+    ensure_dir(REPORT_DIR)
+    path = os.path.join(REPORT_DIR, f"{SNAPSHOT_LABEL}_{_source_infix(source)}{slugify(LOCATION)}.json")
+    _write_json(path, report)
+    return path
+
+
+def strip_proxy_env():
+    # codex and Playwright both misbehave through the local proxy here, so the
+    # whole run goes proxy-free (matches run-daily.sh and the old runPythonScorer).
+    for var in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.pop(var, None)
+
+
+def run_fetch():
+    strip_proxy_env()
+    import asyncio
+
+    import fetch  # noqa: E402 - lazy: pulls in Playwright only when fetching
+
+    asyncio.run(fetch.main())
+
+
+def _registry():
+    import sources
+
+    return sources.SOURCES
+
+
+def enabled_sources():
+    env = os.environ.get("MONITOR_SOURCES")
+    if env:
+        return [s.strip() for s in env.split(",") if s.strip()]
+    return ["nvidia", *sorted(_registry().keys())]
+
+
+def source_display(source):
+    if source == "nvidia":
+        return "NVIDIA"
+    registry = _registry()
+    return registry[source]["display"] if source in registry else source
+
+
+def fetch_source(source):
+    """Fetch + write the current snapshot for one source. NVIDIA uses Playwright (fetch.py);
+    HTTP sources use the sources/ adapters and the shared snapshot renderers."""
+    if source == "nvidia":
+        run_fetch()
+        return
+    import json
+
+    import fetch as fetchmod
+    import sources
+
+    jobs = sources.get_source(source)["fetch"]()
+    base = os.path.join(SNAPSHOT_DIR, f"{SNAPSHOT_LABEL}_{_source_infix(source)}{slugify(LOCATION)}")
+    header = f"{source_display(source)} — {LOCATION}"
+    with open(f"{base}.json", "w", encoding="utf-8") as f:
+        f.write(json.dumps(jobs, ensure_ascii=False, indent=2))
+    with open(f"{base}.md", "w", encoding="utf-8") as f:
+        f.write(fetchmod.render_markdown(jobs, header, SNAPSHOT_LABEL))
+    with open(f"{base}.csv", "w", encoding="utf-8") as f:
+        f.write(fetchmod.render_csv(jobs))
+    print(f"  {source_display(source)}: fetched {len(jobs)} jobs", file=sys.stderr)
+
+
+def run_one_source(source, seed=False):
+    """Full per-source pipeline: fetch -> diff -> score -> per-source report -> persist. Returns the report.
+
+    seed=True scores the entire current backlog (treats every current job as new, unlimited) instead of
+    baselining — used once when onboarding a new company so its existing openings get ranked immediately.
+    """
+    display = source_display(source)
+    if not SKIP_FETCH:
+        fetch_source(source)
+
+    current_file = find_snapshot_by_label(SNAPSHOT_LABEL, source)
+    if not current_file:
+        raise RuntimeError(f"snapshot not found for {source} ({SNAPSHOT_LABEL})")
+    current_jobs = load_snapshot(current_file)
+
+    if seed:
+        report = build_report(
+            current_jobs=current_jobs,
+            previous_jobs=[],  # everything counts as new
+            previous_snapshot_file=current_file,  # non-None so it's not treated as a baseline run
+            snapshot_history=None,
+            successful_score_keys=set(),
+            report_date=SNAPSHOT_LABEL,
+            max_scoring_jobs_per_run=0,  # no per-run cap: score the whole backlog
+            source=source,
+        )
+        print(f"  {display}: seeding — scoring {report['rankedJobCount']} current openings", file=sys.stderr)
+    else:
+        previous_file = find_previous_snapshot(SNAPSHOT_LABEL, source)
+        previous_jobs = load_snapshot(previous_file) if previous_file else []
+        history = load_snapshot_history(SNAPSHOT_LABEL, source)
+        if not is_date_label(SNAPSHOT_LABEL) and not any(e["label"] == SNAPSHOT_LABEL for e in history):
+            history = [*history, {"label": SNAPSHOT_LABEL, "file": current_file, "jobs": current_jobs}]
+        successful = collect_successful_score_keys(load_dated_reports(SNAPSHOT_LABEL, source))
+        report = build_report(
+            current_jobs=current_jobs,
+            previous_jobs=previous_jobs,
+            previous_snapshot_file=previous_file,
+            snapshot_history=history,
+            successful_score_keys=successful,
+            source=source,
+        )
+    report_file = write_source_report(report, source)
+
+    if is_date_label(SNAPSHOT_LABEL):
+        try:
+            import db
+
+            persisted = db.persist_daily_run_from_env(
+                source=source,
+                location=LOCATION,
+                run_date=SNAPSHOT_LABEL,
+                current_jobs=current_jobs,
+                report=report,
+                snapshot_file=current_file,
+                report_file=report_file,
+                profile_cache_path=PROFILE_CACHE,
+            )
+            if persisted.get("skipped"):
+                print(f"  {display}: MySQL persistence skipped (set MYSQL_USER/MYSQL_SOCKET_PATH).", file=sys.stderr)
+            else:
+                print(
+                    f"  {display}: persisted run {persisted['run_id']} — "
+                    f"{persisted['job_snapshots']} snapshots, {persisted['scores']} scores.",
+                    file=sys.stderr,
+                )
+        except Exception as error:  # noqa: BLE001 - persistence failures shouldn't drop the report
+            if os.environ.get("NVIDIA_DB_REQUIRED") == "1":
+                raise
+            print(f"  {display}: WARN MySQL persistence failed: {error}", file=sys.stderr)
+    return report
+
+
+def build_grouped(results):
+    keys = (
+        "currentJobCount", "addedCount", "canceledCount", "rankedJobCount",
+        "backlogCount", "deferredScoreCount", "scoreErrorCount",
+    )
+    totals = {k: sum((r["report"].get(k) or 0) for r in results) for k in keys}
+    return {"date": SNAPSHOT_LABEL, "location": LOCATION, "sources": results, "totals": totals}
+
+
+def render_grouped_markdown(grouped):
+    t = grouped["totals"]
+    md = f"# Daily jobs — {grouped['location']} — {grouped['date']}\n\n"
+    md += f"- Companies: {len(grouped['sources'])}\n"
+    md += (
+        f"- Active: {t['currentJobCount']} · Added: {t['addedCount']} · "
+        f"Scored: {t['rankedJobCount']} · Canceled: {t['canceledCount']}\n"
+    )
+    for entry in grouped["sources"]:
+        r = entry["report"]
+        md += f"\n## {entry['display']} (+{r['addedCount']}, {r['rankedJobCount']} scored, -{r['canceledCount']})\n"
+        if r.get("baselineCreated"):
+            md += "\nBaseline established today.\n"
+            continue
+        if not r["rankedJobs"]:
+            md += "\n_No newly scored jobs._\n"
+        for i, job in enumerate(r["rankedJobs"]):
+            md += f"\n### {i + 1}. [{job['jr']}] {job['title']}\n"
+            md += f"- Fit: {job['suitability']} ({job['score']}) · {job['recommendation']}\n"
+            if job.get("firstSeenDate"):
+                md += f"- Added: {job['firstSeenDate']}\n"
+            md += f"- Link: {job['link']}\n"
+            if job.get("verdict"):
+                md += f"- Verdict: {job['verdict']}\n"
+        if r["canceledJobs"]:
+            md += "\n**Canceled:** " + ", ".join(f"[{c['jr']}] {c['title']}" for c in r["canceledJobs"]) + "\n"
+    return md
+
+
+def render_grouped_telegram(grouped):
+    t = grouped["totals"]
+    lines = [
+        f"🦀 Jobs — {grouped['location']} — {grouped['date']}",
+        f"{t['currentJobCount']} active · +{t['addedCount']} added · "
+        f"{t['rankedJobCount']} scored · -{t['canceledCount']} canceled",
+    ]
+    body = {"text": "", "truncated": 0}
+
+    def try_append(chunk):
+        if _u16len("\n".join(lines)) + _u16len(body["text"]) + _u16len(chunk) + 1 > TELEGRAM_BUDGET:
+            body["truncated"] += 1
+            return False
+        body["text"] += chunk
+        return True
+
+    for entry in grouped["sources"]:
+        r = entry["report"]
+        if r.get("baselineCreated"):
+            try_append(f"\n\n=== {entry['display']} ===\nBaseline established.")
+            continue
+        actionable = [j for j in r["rankedJobs"] if j.get("recommendation") != "Skip"]
+        skip_pile = [j for j in r["rankedJobs"] if j.get("recommendation") == "Skip"]
+        if not (actionable or skip_pile or r["canceledJobs"]):
+            continue
+        if not try_append(f"\n\n=== {entry['display']} (+{r['addedCount']}) ==="):
+            continue
+        # Cap actionable items per company so one big day (e.g. a seed) can't crowd out other companies.
+        for i, j in enumerate(actionable[:TELEGRAM_PER_COMPANY]):
+            head = f"\n{i + 1}. {fit_icon(j.get('suitability'))} [{j['jr']}] {j['title']} ({j['score']}) · {j['recommendation']}"
+            verdict = f"\n   {first_sentence(j['verdict'], 140)}" if j.get("verdict") else ""
+            try_append(head + verdict + f"\n   {j['link']}")
+        if len(actionable) > TELEGRAM_PER_COMPANY:
+            try_append(f"\n   …+{len(actionable) - TELEGRAM_PER_COMPANY} more scored (see full report)")
+        if skip_pile:
+            try_append(f"\n⚪️ Skip ({len(skip_pile)}): " + ", ".join(j["jr"] for j in skip_pile[:8]))
+        if r["canceledJobs"]:
+            try_append(f"\n❌ Canceled ({len(r['canceledJobs'])}): " + ", ".join(c["jr"] for c in r["canceledJobs"][:8]))
+
+    if body["truncated"] > 0:
+        body["text"] += f"\n\n…{body['truncated']} item(s) trimmed; see latest_{slugify(grouped['location'])}.md."
+    out = "\n".join(lines) + body["text"]
+    return _u16slice(out, TELEGRAM_LIMIT - 1) + "…" if _u16len(out) > TELEGRAM_LIMIT else out
+
+
+def write_grouped(grouped):
+    ensure_dir(REPORT_DIR)
+    slug = slugify(LOCATION)
+    latest = os.path.join(REPORT_DIR, f"latest_{slug}")
+    _write_json(f"{latest}.json", grouped)
+    with open(f"{latest}.md", "w", encoding="utf-8") as f:
+        f.write(render_grouped_markdown(grouped))
+    with open(f"{latest}_telegram.md", "w", encoding="utf-8") as f:
+        f.write(render_grouped_telegram(grouped))
+    if is_date_label(SNAPSHOT_LABEL):
+        _write_json(os.path.join(REPORT_DIR, f"{SNAPSHOT_LABEL}_{slug}_grouped.json"), grouped)
+
+
+def main():
+    strip_proxy_env()  # codex (in-process scorer) and Playwright run proxy-free, even when fetch is skipped
+    release_lock = acquire_run_lock()
+    try:
+        ensure_dir(REPORT_DIR)
+        # Prevent cron from delivering stale latest_* reports if this run fails before write_grouped().
+        remove_latest_report_files()
+
+        sources_list = enabled_sources()
+        seed_set = {s.strip() for s in (os.environ.get("SEED_SOURCES") or "").split(",") if s.strip()}
+        print(f'Running daily jobs monitor for "{LOCATION}" — sources: {", ".join(sources_list)}', file=sys.stderr)
+        if seed_set:
+            print(f"Seed-scoring backlog for: {', '.join(sorted(seed_set))}", file=sys.stderr)
+        if SKIP_FETCH:
+            print("Skipping fetch because NVIDIA_SKIP_FETCH=1.", file=sys.stderr)
+
+        results = []
+        for source in sources_list:
+            try:
+                report = run_one_source(source, seed=(source in seed_set))
+                results.append({"source": source, "display": source_display(source), "report": report})
+            except Exception as error:  # noqa: BLE001 - one source failing must not kill the rest
+                print(f"WARN source '{source}' failed: {error}", file=sys.stderr)
+
+        if not results:
+            raise RuntimeError("all sources failed")
+
+        grouped = build_grouped(results)
+        write_grouped(grouped)
+        t = grouped["totals"]
+        print(
+            f"Wrote grouped report — {len(results)} companies, added {t['addedCount']}, "
+            f"scored {t['rankedJobCount']}, canceled {t['canceledCount']}.",
+            file=sys.stderr,
+        )
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:  # noqa: BLE001 - mirror JS top-level catch
+        print(f"FATAL {error}", file=sys.stderr)
+        sys.exit(1)
