@@ -6,6 +6,9 @@ node_modules/
 # local env / secrets (keep .env.example tracked)
 .env
 
+# local-only project guidance (personal paths/config — do not publish)
+CLAUDE.md
+
 # python / macOS junk
 __pycache__/
 *.pyc
