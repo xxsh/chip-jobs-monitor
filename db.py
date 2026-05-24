@@ -543,6 +543,62 @@ def upsert_score(conn, source, run_id, run_date, score, profile_hash, resume_pat
     ]
     with conn.cursor() as cur:
         cur.execute(sql, params)
+    return job_id
+
+
+def upsert_resume_score(conn, *, source, job_id, run_date, score, profile_hash, resume_path, report_file=None):
+    """Upsert into the profile-keyed authoritative view (resume_scores).
+
+    Keyed UNIQUE(profile_hash, job_id): one row per job per resume profile, so
+    re-scoring under the same resume updates in place. This is the table the
+    dashboard treats as the current-resume score; run-keyed `scores` stays the
+    per-run history. db.py writes this on every daily run (db.mjs does NOT — it
+    is intentionally outside the verify_db.py parity contract); the manual
+    rescore importer writes the same table with the same key.
+    """
+    fallback_date = to_mysql_date(score.get("firstSeenDate")) or run_date
+    score_first_seen_date = resolve_job_posted_date(score, fallback_date)
+    sql = """
+      INSERT INTO resume_scores (
+        job_id, source, profile_hash, resume_path, score, suitability, recommendation,
+        matched_reasons, gap_reasons, verdict, first_seen_date, matched_keywords,
+        selection_reasons, report_file, raw_score
+      )
+      VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSON), CAST(%s AS JSON), %s, %s, CAST(%s AS JSON), CAST(%s AS JSON), %s, CAST(%s AS JSON))
+      ON DUPLICATE KEY UPDATE
+        source = VALUES(source),
+        resume_path = VALUES(resume_path),
+        score = VALUES(score),
+        suitability = VALUES(suitability),
+        recommendation = VALUES(recommendation),
+        matched_reasons = VALUES(matched_reasons),
+        gap_reasons = VALUES(gap_reasons),
+        verdict = VALUES(verdict),
+        first_seen_date = VALUES(first_seen_date),
+        matched_keywords = VALUES(matched_keywords),
+        selection_reasons = VALUES(selection_reasons),
+        report_file = VALUES(report_file),
+        raw_score = VALUES(raw_score)
+    """
+    params = [
+        job_id,
+        source,
+        profile_hash,
+        _coalesce(resume_path),
+        _coalesce(score.get("score")),
+        _coalesce(score.get("suitability")),
+        _coalesce(score.get("recommendation")),
+        json_param(_coalesce(score.get("matchedReasons"), [])),
+        json_param(_coalesce(score.get("gapReasons"), [])),
+        _coalesce(score.get("verdict")),
+        score_first_seen_date,
+        json_param(_coalesce(score.get("matchedKeywords"), [])),
+        json_param(_coalesce(score.get("selectionReasons"), [])),
+        _coalesce(report_file),
+        json_param(score),
+    ]
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
 
 
 def upsert_cancellation(conn, source, location_slug, run_id, canceled):
@@ -599,16 +655,33 @@ def persist_daily_run(
         for job in current_jobs or []:
             job_id = upsert_job(conn, source=source, run_id=run_id, run_date=run_date, job=job)
             upsert_job_snapshot(conn, source=source, run_id=run_id, job_id=job_id, job=job)
+        resume_path = _coalesce(report.get("resumePath"))
+        resume_score_count = 0
         for score in report.get("rankedJobs") or []:
-            upsert_score(
+            job_id = upsert_score(
                 conn,
                 source=source,
                 run_id=run_id,
                 run_date=run_date,
                 score=score,
                 profile_hash=profile_hash,
-                resume_path=_coalesce(report.get("resumePath")),
+                resume_path=resume_path,
             )
+            # Mirror the daily score into the profile-keyed authoritative view.
+            # Only real model scores (numeric, no error) belong there — skip
+            # errored rows; require a profile_hash since it's part of the key.
+            if profile_hash and score.get("score") is not None and not score.get("error"):
+                upsert_resume_score(
+                    conn,
+                    source=source,
+                    job_id=job_id,
+                    run_date=run_date,
+                    score=score,
+                    profile_hash=profile_hash,
+                    resume_path=resume_path,
+                    report_file=report_file,
+                )
+                resume_score_count += 1
         for canceled in report.get("canceledJobs") or []:
             upsert_cancellation(conn, source=source, location_slug=location_slug, run_id=run_id, canceled=canceled)
         conn.commit()
@@ -616,6 +689,7 @@ def persist_daily_run(
             "run_id": run_id,
             "job_snapshots": len(current_jobs or []),
             "scores": len(report.get("rankedJobs") or []),
+            "resume_scores": resume_score_count,
             "cancellations": len(report.get("canceledJobs") or []),
         }
     except Exception:

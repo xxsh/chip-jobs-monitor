@@ -122,6 +122,33 @@ CREATE TABLE IF NOT EXISTS scores (
   CONSTRAINT fk_scores_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS resume_scores (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  job_id BIGINT UNSIGNED NOT NULL,
+  source VARCHAR(64) NOT NULL,
+  profile_hash VARCHAR(64) NOT NULL,
+  resume_path VARCHAR(1024) NULL,
+  score TINYINT UNSIGNED NOT NULL,
+  suitability VARCHAR(64) NULL,
+  recommendation VARCHAR(64) NULL,
+  matched_reasons JSON NULL,
+  gap_reasons JSON NULL,
+  verdict MEDIUMTEXT NULL,
+  first_seen_date DATE NULL,
+  matched_keywords JSON NULL,
+  selection_reasons JSON NULL,
+  report_file VARCHAR(512) NULL,
+  raw_score JSON NOT NULL,
+  scored_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_resume_scores_profile_job (profile_hash, job_id),
+  KEY idx_resume_scores_job (job_id),
+  KEY idx_resume_scores_source_score (source, score),
+  CONSTRAINT chk_resume_scores_range CHECK (score <= 100),
+  CONSTRAINT fk_resume_scores_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS cancellations (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   run_id BIGINT UNSIGNED NOT NULL,

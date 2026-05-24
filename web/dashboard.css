@@ -427,18 +427,36 @@ svg {
 }
 
 .pill,
-.source-pill {
+.source-pill,
+.profile-pill,
+.score-delta {
   display: inline-flex;
   align-items: center;
   min-height: 21px;
   padding: 3px 7px;
+  border-radius: 999px;
+}
+
+.pill,
+.source-pill {
   color: var(--paper);
   background: var(--black);
-  border-radius: 999px;
 }
 
 .source-pill {
   background: var(--source-color);
+}
+
+.profile-pill {
+  color: var(--paper);
+  background: var(--cyan);
+  font-weight: 800;
+}
+
+.score-delta {
+  color: var(--ink);
+  background: var(--paper-2);
+  border: 1px solid var(--line);
 }
 
 .status-pill {
@@ -492,6 +510,228 @@ svg {
 
 .error {
   grid-column: 1 / -1;
+}
+
+/* ---- interactive scored-roles table ---- */
+.panel-roles-full {
+  margin-top: 14px;
+  min-height: 0;
+}
+
+.roles-head {
+  flex-wrap: wrap;
+}
+
+.roles-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.roles-controls select,
+.roles-controls input {
+  height: 30px;
+  padding: 0 9px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: Menlo, Monaco, monospace;
+  font-size: 12px;
+}
+
+.roles-controls input[type="search"] {
+  min-width: 200px;
+}
+
+.roles-controls select:focus,
+.roles-controls input:focus {
+  outline: 2px solid var(--cyan);
+  outline-offset: 1px;
+}
+
+.roles-count {
+  color: var(--muted);
+  font-family: Menlo, Monaco, monospace;
+  font-size: 12px;
+}
+
+.roles-table-wrap {
+  margin-top: 12px;
+  max-height: 560px;
+  overflow: auto;
+}
+
+.roles-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.roles-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 9px 10px;
+  color: var(--muted);
+  background: var(--paper-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.roles-table th.num,
+.roles-table td.num {
+  text-align: center;
+  white-space: nowrap;
+}
+
+.roles-table tbody td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.roles-table tbody tr:nth-child(even) {
+  background: rgba(16, 19, 15, 0.025);
+}
+
+.roles-table tbody tr:hover {
+  background: rgba(25, 127, 150, 0.08);
+}
+
+.roles-table td.mono {
+  color: var(--muted);
+  font-family: Menlo, Monaco, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.fit-cell {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.role-cell a {
+  color: var(--ink);
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.role-cell a:hover {
+  color: var(--cyan);
+}
+
+.role-dept {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-family: Menlo, Monaco, monospace;
+  font-size: 11px;
+}
+
+.score-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 3px 7px;
+  color: var(--paper);
+  border-radius: 6px;
+  font-family: Menlo, Monaco, monospace;
+  font-weight: 800;
+}
+
+.score-chip.strong {
+  background: var(--green);
+}
+
+.score-chip.good {
+  background: var(--cyan);
+}
+
+.score-chip.stretch {
+  background: var(--yellow);
+}
+
+.score-chip.low {
+  background: var(--muted);
+}
+
+.rec {
+  display: inline-flex;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.rec-apply {
+  color: var(--paper);
+  background: var(--green);
+}
+
+.rec-maybe {
+  color: var(--ink);
+  background: rgba(201, 140, 32, 0.22);
+}
+
+.rec-skip {
+  color: var(--muted);
+  background: var(--paper-2);
+}
+
+.delta {
+  font-family: Menlo, Monaco, monospace;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.delta-up {
+  color: var(--green);
+}
+
+.delta-down {
+  color: var(--red);
+}
+
+.delta-flat,
+.delta-none {
+  color: var(--muted);
+}
+
+/* ---- chart hover tooltips ---- */
+.hit {
+  fill: transparent;
+  cursor: pointer;
+}
+
+.fit-seg {
+  cursor: pointer;
+}
+
+.chart-tip {
+  position: fixed;
+  z-index: 20;
+  max-width: 240px;
+  padding: 8px 10px;
+  color: var(--paper);
+  background: var(--black);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  font-family: Menlo, Monaco, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-line;
+  pointer-events: none;
+}
+
+.chart-tip[hidden] {
+  display: none;
 }
 
 @media (max-width: 1220px) {
