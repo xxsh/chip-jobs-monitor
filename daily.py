@@ -259,6 +259,22 @@ def load_profile_highlights():
         return []
 
 
+def load_profile_hash():
+    """Current profile identity (resumeHash from profile_latest.json), or None.
+
+    Used to make backlog convergence profile-aware: a job scored under a
+    different resume is re-scored under the current one. Same source of truth
+    db.py reads for scores.profile_hash.
+    """
+    if not os.path.exists(PROFILE_CACHE):
+        return None
+    try:
+        data = _load_json(PROFILE_CACHE)
+        return data.get("resumeHash") if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 def partition_diff(current_jobs, previous_jobs):
     previous_ids = {job_key(job) for job in previous_jobs}
     current_ids = {job_key(job) for job in current_jobs}
@@ -399,10 +415,25 @@ def build_first_seen_by_key(snapshot_history):
     return first_seen
 
 
-def collect_successful_score_keys(report_entries):
+def collect_successful_score_keys(report_entries, current_profile_hash=None):
+    """Keys of jobs already successfully scored under the *current* profile.
+
+    When the resume changes, profile_latest.json's resumeHash changes; reports
+    stamped with a different profileHash are then ignored here, so their jobs
+    become eligible for re-scoring under the new resume (capped per run, so the
+    backlog converges over a few days rather than in one expensive batch).
+
+    Reports with no profileHash — written before profile-aware convergence, or
+    when there is no profile pointer — are treated as matching, to avoid a
+    full-backlog re-score storm on legacy data; use the manual full rescore
+    (`npm run rescore:import`) to refresh those at once.
+    """
     successful = set()
     for entry in report_entries or []:
         report = entry.get("report") if isinstance(entry, dict) and "report" in entry else entry
+        report_hash = report.get("profileHash") if isinstance(report, dict) else None
+        if current_profile_hash and report_hash and report_hash != current_profile_hash:
+            continue
         scored_jobs = []
         if isinstance(report.get("rankedJobs"), list):
             scored_jobs.extend(report["rankedJobs"])
@@ -628,6 +659,7 @@ def build_report(
     max_scoring_jobs_per_run=None,
     score_fn=run_scorer,
     source=None,
+    profile_hash=None,
 ):
     if report_date is None:
         report_date = SNAPSHOT_LABEL
@@ -644,6 +676,7 @@ def build_report(
             "previousSnapshot": None,
             "baselineCreated": True,
             "profileHighlights": profile_highlights,
+            "profileHash": profile_hash,
             "currentJobCount": len(current_jobs),
             "addedCount": 0,
             "canceledCount": 0,
@@ -699,6 +732,7 @@ def build_report(
         "previousSnapshot": os.path.basename(previous_snapshot_file),
         "baselineCreated": False,
         "profileHighlights": profile_highlights,
+        "profileHash": profile_hash,
         "currentJobCount": len(current_jobs),
         "addedCount": len(new_jobs),
         "canceledCount": len(canceled_jobs),
@@ -819,6 +853,7 @@ def run_one_source(source, seed=False):
     if not current_file:
         raise RuntimeError(f"snapshot not found for {source} ({SNAPSHOT_LABEL})")
     current_jobs = load_snapshot(current_file)
+    current_profile_hash = load_profile_hash()
 
     if seed:
         report = build_report(
@@ -830,6 +865,7 @@ def run_one_source(source, seed=False):
             report_date=SNAPSHOT_LABEL,
             max_scoring_jobs_per_run=0,  # no per-run cap: score the whole backlog
             source=source,
+            profile_hash=current_profile_hash,
         )
         print(f"  {display}: seeding — scoring {report['rankedJobCount']} current openings", file=sys.stderr)
     else:
@@ -838,7 +874,9 @@ def run_one_source(source, seed=False):
         history = load_snapshot_history(SNAPSHOT_LABEL, source)
         if not is_date_label(SNAPSHOT_LABEL) and not any(e["label"] == SNAPSHOT_LABEL for e in history):
             history = [*history, {"label": SNAPSHOT_LABEL, "file": current_file, "jobs": current_jobs}]
-        successful = collect_successful_score_keys(load_dated_reports(SNAPSHOT_LABEL, source))
+        successful = collect_successful_score_keys(
+            load_dated_reports(SNAPSHOT_LABEL, source), current_profile_hash
+        )
         report = build_report(
             current_jobs=current_jobs,
             previous_jobs=previous_jobs,
@@ -846,6 +884,7 @@ def run_one_source(source, seed=False):
             snapshot_history=history,
             successful_score_keys=successful,
             source=source,
+            profile_hash=current_profile_hash,
         )
     report_file = write_source_report(report, source)
 
@@ -868,7 +907,8 @@ def run_one_source(source, seed=False):
             else:
                 print(
                     f"  {display}: persisted run {persisted['run_id']} — "
-                    f"{persisted['job_snapshots']} snapshots, {persisted['scores']} scores.",
+                    f"{persisted['job_snapshots']} snapshots, {persisted['scores']} scores "
+                    f"({persisted.get('resume_scores', 0)} → current resume).",
                     file=sys.stderr,
                 )
         except Exception as error:  # noqa: BLE001 - persistence failures shouldn't drop the report

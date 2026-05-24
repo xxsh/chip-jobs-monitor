@@ -218,6 +218,50 @@ class DailyTests(unittest.TestCase):
         self.assertIn(daily.job_key({"id": 1}), keys)
         self.assertNotIn(daily.job_key({"id": 2}), keys)
 
+    def test_collect_successful_score_keys_profile_aware(self):
+        entries = [
+            {"report": {"profileHash": "hashA", "rankedJobs": [{"id": 1, "score": 70}]}},
+            {"report": {"profileHash": "hashB", "rankedJobs": [{"id": 2, "score": 70}]}},
+            {"report": {"rankedJobs": [{"id": 3, "score": 70}]}},  # legacy, no hash
+        ]
+        # Current resume == hashA: only same-hash + legacy(no-hash) count as handled.
+        keys = daily.collect_successful_score_keys(entries, "hashA")
+        self.assertIn(daily.job_key({"id": 1}), keys)
+        self.assertNotIn(daily.job_key({"id": 2}), keys)  # scored under a different resume -> re-score
+        self.assertIn(daily.job_key({"id": 3}), keys)  # legacy reports treated as matching
+        # No current hash -> profile-blind (original behavior): everything counts.
+        self.assertEqual(
+            daily.collect_successful_score_keys(entries),
+            {daily.job_key({"id": i}) for i in (1, 2, 3)},
+        )
+
+    def test_build_report_stamps_profile_hash(self):
+        report = daily.build_report(
+            current_jobs=[{"id": 1, "jr": "JR1", "name": "Old"}], previous_jobs=[],
+            previous_snapshot_file=None, profile_hash="hashA",
+        )
+        self.assertEqual(report["profileHash"], "hashA")
+
+    def test_build_report_rescores_on_profile_change(self):
+        # A job successfully scored under the old resume is NOT in the current
+        # profile's handled set, so it gets re-scored under the new resume.
+        day1 = [{"id": 1, "jr": "JR1", "name": "Old"}]
+        day2 = [*day1, {"id": 2, "jr": "JR2", "name": "Scored under resume A", "link": "https://x", "locations": ["China, Shanghai"]}]
+        prior_reports = [{"report": {"profileHash": "hashA", "rankedJobs": [{"id": 2, "jr": "JR2", "score": 60}]}}]
+        received = {}
+
+        def fake(jobs):
+            received["jobs"] = jobs
+            return []
+
+        new_hash_keys = daily.collect_successful_score_keys(prior_reports, "hashB")
+        daily.build_report(
+            current_jobs=day2, previous_jobs=day1, previous_snapshot_file="/tmp/2026-05-01.json",
+            snapshot_history=[{"label": "2026-05-01", "jobs": day1}, {"label": "2026-05-02", "jobs": day2}],
+            successful_score_keys=new_hash_keys, score_fn=fake, profile_hash="hashB",
+        )
+        self.assertEqual([j["jr"] for j in received["jobs"]], ["JR2"])
+
     def test_build_report_skips_intern(self):
         previous = [{"id": 1, "jr": "JR1", "name": "Old"}]
         current = [
