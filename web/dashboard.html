@@ -45,6 +45,7 @@
         <article class="panel panel-roles">
           <div class="panel-head">
             <h2>Top scored roles</h2>
+            <span>vs current resume</span>
           </div>
           <ol class="role-list" id="topRoles"></ol>
         </article>
@@ -63,8 +64,51 @@
           <ul class="change-list muted" id="recentCancels"></ul>
         </article>
       </section>
+
+      <section class="panel panel-roles-full" aria-label="Scored roles">
+        <div class="panel-head roles-head">
+          <h2>Scored roles vs current resume</h2>
+          <div class="roles-controls">
+            <select id="roleCompany" aria-label="Filter by company">
+              <option value="">All companies</option>
+            </select>
+            <select id="roleFit" aria-label="Filter by fit">
+              <option value="">All fits</option>
+              <option value="Strong fit">Strong</option>
+              <option value="Good fit">Good</option>
+              <option value="Possible stretch">Stretch</option>
+              <option value="Low fit">Low</option>
+            </select>
+            <select id="roleSort" aria-label="Sort roles">
+              <option value="score">Sort: score</option>
+              <option value="delta">Sort: Δ resume</option>
+              <option value="date">Sort: date</option>
+            </select>
+            <input id="roleSearch" type="search" placeholder="search title / JR / dept…" aria-label="Search roles">
+            <span id="roleCount" class="roles-count"></span>
+          </div>
+        </div>
+        <div class="roles-table-wrap">
+          <table class="roles-table">
+            <thead>
+              <tr>
+                <th class="num">Score</th>
+                <th>Company</th>
+                <th>Fit</th>
+                <th>Role</th>
+                <th>Rec</th>
+                <th class="num">Δ resume</th>
+                <th>JR</th>
+                <th>First seen</th>
+              </tr>
+            </thead>
+            <tbody id="rolesBody"></tbody>
+          </table>
+        </div>
+      </section>
     </main>
 
+    <div id="chartTip" class="chart-tip" hidden></div>
     <script type="module" src="/dashboard.js"></script>
   </body>
 </html>

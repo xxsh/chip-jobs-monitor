@@ -5,9 +5,18 @@ const rangeLabelEl = document.querySelector('#rangeLabel');
 const activeChartEl = document.querySelector('#activeChart');
 const sourceChartEl = document.querySelector('#sourceChart');
 const fitChartEl = document.querySelector('#fitChart');
+const rolesBodyEl = document.querySelector('#rolesBody');
+const roleCompanyEl = document.querySelector('#roleCompany');
+const roleFitEl = document.querySelector('#roleFit');
+const roleSortEl = document.querySelector('#roleSort');
+const roleSearchEl = document.querySelector('#roleSearch');
+const roleCountEl = document.querySelector('#roleCount');
+const chartTipEl = document.querySelector('#chartTip');
 const topRolesEl = document.querySelector('#topRoles');
 const recentAddsEl = document.querySelector('#recentAdds');
 const recentCancelsEl = document.querySelector('#recentCancels');
+
+let allRoles = [];
 
 const sourceColors = {
   amd: '#d3352f',
@@ -59,13 +68,16 @@ function pointsToPath(points) {
 }
 
 function renderMetrics(summary) {
+  const profileNote = summary.profileHash
+    ? `profile ${String(summary.profileHash).slice(0, 8)}`
+    : 'profile unavailable';
   const cards = [
     ['Active roles', fmt(summary.activeJobs), `${fmtSigned(summary.activeDelta)} vs previous source runs`],
     ['Companies', fmt(summary.sourceCount), `${summary.location || 'All locations'} · latest ${summary.latestDate || 'no runs'}`],
     ['Latest added', fmt(summary.latestAdded), `${fmt(summary.totalAdded)} added across history`],
     ['Latest canceled', fmt(summary.latestCanceled), `${fmt(summary.totalCanceled)} canceled across history`],
-    ['Scored roles', fmt(summary.totalScored), `${fmt(summary.queued)} still queued`],
-    ['Best score', summary.bestScore ?? 'N/A', `${fmt(summary.latestScored)} scored latest run`],
+    ['Profile scores', fmt(summary.resumeScoreCount), `${fmt(summary.totalScored)} historical scores retained`],
+    ['Best score', summary.bestScore ?? 'N/A', `latest resume · ${profileNote}`],
   ];
   metricsEl.innerHTML = cards.map(([label, value, note]) => `
     <article class="metric">
@@ -162,6 +174,11 @@ function renderActiveChart(runs) {
       ${bars}
       <path class="active-line" d="${pointsToPath(points)}"></path>
       ${points.map((point) => `<circle class="dot" cx="${point.x}" cy="${point.y}" r="4"></circle>`).join('')}
+      ${points.map((point, index) => {
+        const row = runs[index];
+        const tip = `${row.date}\nactive ${fmt(row.activeJobs)}\n+${fmt(row.added)} added · -${fmt(row.canceled)} canceled`;
+        return `<circle class="hit" cx="${point.x}" cy="${point.y}" r="11" data-tip="${escapeHtml(tip)}"></circle>`;
+      }).join('')}
       <text class="chart-label" x="${padding.left}" y="${padding.top + 6}">${fmt(maxActive)} active max</text>
       <text class="chart-label" x="${padding.left}" y="${height - padding.bottom - 92}">green posted / red canceled</text>
       <text class="chart-label" x="${width - padding.right}" y="${padding.top + 6}" text-anchor="end">${coverageExpanded ? 'line includes onboarding' : `${fmt(latest.sourceCount)} sources latest`}</text>
@@ -215,10 +232,12 @@ function renderFitChart(series) {
   const bars = series.map((row, index) => {
     const x = padding.left + index * slotW + Math.max(0, (slotW - barW) / 2);
     let y = height - padding.bottom;
+    const labels = { strongFit: 'Strong', goodFit: 'Good', possibleStretch: 'Stretch', lowFit: 'Low' };
     return ['lowFit', 'possibleStretch', 'goodFit', 'strongFit'].map((key) => {
       const h = (row[key] / maxTotal) * plotH;
       y -= h;
-      return `<rect x="${x}" y="${y}" width="${barW}" height="${h}" fill="${fitColors[key]}" rx="2"></rect>`;
+      const tip = `${row.date}\n${labels[key]} fit: ${fmt(row[key])}`;
+      return `<rect class="fit-seg" x="${x}" y="${y}" width="${barW}" height="${h}" fill="${fitColors[key]}" rx="2" data-tip="${escapeHtml(tip)}"></rect>`;
     }).join('');
   }).join('');
 
@@ -255,19 +274,126 @@ function statusPill(row) {
   return `<span class="status-pill ${status}">${status}</span>`;
 }
 
+const FIT_ORDER = { 'Strong fit': 0, 'Good fit': 1, 'Possible stretch': 2, 'Low fit': 3 };
+
+function recClass(rec) {
+  if (rec === 'Apply') return 'rec-apply';
+  if (rec === 'Maybe') return 'rec-maybe';
+  return 'rec-skip';
+}
+
+function deltaCell(role) {
+  if (!Number(role.resumeScored) || role.previousScore == null || role.scoreDelta == null) {
+    return '<span class="delta-none">—</span>';
+  }
+  const d = Number(role.scoreDelta);
+  const cls = d > 0 ? 'delta-up' : d < 0 ? 'delta-down' : 'delta-flat';
+  const arrow = d > 0 ? '▲' : d < 0 ? '▼' : '·';
+  return `<span class="delta ${cls}" title="was ${escapeHtml(role.previousScore)} under the previous resume">${arrow} ${d >= 0 ? '+' : ''}${d}</span>`;
+}
+
+function scoreDeltaPill(role) {
+  if (!Number(role.resumeScored) || role.previousScore == null || role.scoreDelta == null) return '';
+  const delta = Number(role.scoreDelta);
+  return `<span class="score-delta">old ${escapeHtml(role.previousScore)} · ${delta >= 0 ? '+' : ''}${escapeHtml(delta)}</span>`;
+}
+
 function renderTopRoles(roles) {
-  topRolesEl.innerHTML = roles.map((role) => `
+  topRolesEl.innerHTML = roles.slice(0, 12).map((role) => `
     <li>
       <a href="${escapeHtml(role.link || '#')}" target="_blank" rel="noreferrer">${escapeHtml(role.title)}</a>
       <div class="meta">
         ${sourcePill(role)}
         ${statusPill(role)}
         <span class="pill ${suitabilityClass(role.suitability)}">${escapeHtml(role.score)} · ${escapeHtml(role.suitability)}</span>
+        ${Number(role.resumeScored) ? '<span class="profile-pill">latest resume</span>' : ''}
+        ${scoreDeltaPill(role)}
         <span>${escapeHtml(role.jr)}</span>
         <span>${escapeHtml(role.date)}</span>
       </div>
     </li>
   `).join('') || '<li class="empty">No scored roles</li>';
+}
+
+function renderRolesTable() {
+  const company = roleCompanyEl.value;
+  const fit = roleFitEl.value;
+  const sort = roleSortEl.value;
+  const query = roleSearchEl.value.trim().toLowerCase();
+
+  const rows = allRoles
+    .filter((role) => {
+      if (company && role.source !== company) return false;
+      if (fit && role.suitability !== fit) return false;
+      if (query) {
+        const hay = `${role.title || ''} ${role.jr || ''} ${role.department || ''}`.toLowerCase();
+        if (!hay.includes(query)) return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      if (sort === 'delta') {
+        const da = a.scoreDelta == null ? -Infinity : Number(a.scoreDelta);
+        const db = b.scoreDelta == null ? -Infinity : Number(b.scoreDelta);
+        return db - da || Number(b.score) - Number(a.score);
+      }
+      if (sort === 'date') {
+        return String(b.date || '').localeCompare(String(a.date || '')) || Number(b.score) - Number(a.score);
+      }
+      return Number(b.score) - Number(a.score) || (FIT_ORDER[a.suitability] ?? 9) - (FIT_ORDER[b.suitability] ?? 9);
+    });
+
+  roleCountEl.textContent = `${rows.length} of ${allRoles.length}`;
+  rolesBodyEl.innerHTML = rows.map((role) => `
+    <tr>
+      <td class="num"><span class="score-chip ${suitabilityClass(role.suitability)}">${escapeHtml(role.score)}</span></td>
+      <td><span class="source-pill" style="--source-color: ${colorForSource(role.source)}">${escapeHtml(role.sourceDisplay || role.source)}</span></td>
+      <td class="fit-cell">${escapeHtml(role.suitability || '—')}</td>
+      <td class="role-cell">
+        <a href="${escapeHtml(role.link || '#')}" target="_blank" rel="noreferrer">${escapeHtml(role.title)}</a>
+        ${role.department ? `<span class="role-dept">${escapeHtml(role.department)}</span>` : ''}
+      </td>
+      <td><span class="rec ${recClass(role.recommendation)}">${escapeHtml(role.recommendation || '—')}</span></td>
+      <td class="num">${deltaCell(role)}</td>
+      <td class="mono">${escapeHtml(role.jr || '—')}</td>
+      <td class="mono">${escapeHtml(role.date || '—')}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="8" class="empty">No roles match these filters</td></tr>';
+}
+
+function setupRolesControls(sources) {
+  roleCompanyEl.innerHTML = ['<option value="">All companies</option>']
+    .concat((sources || []).map((s) => `<option value="${escapeHtml(s.source)}">${escapeHtml(s.display)}</option>`))
+    .join('');
+  for (const el of [roleCompanyEl, roleFitEl, roleSortEl]) el.onchange = renderRolesTable;
+  roleSearchEl.oninput = renderRolesTable;
+}
+
+function showTip(text, x, y) {
+  chartTipEl.textContent = text;
+  chartTipEl.hidden = false;
+  const pad = 14;
+  const rect = chartTipEl.getBoundingClientRect();
+  let left = x + pad;
+  let top = y + pad;
+  if (left + rect.width > window.innerWidth - 8) left = x - rect.width - pad;
+  if (top + rect.height > window.innerHeight - 8) top = y - rect.height - pad;
+  chartTipEl.style.left = `${Math.max(8, left)}px`;
+  chartTipEl.style.top = `${Math.max(8, top)}px`;
+}
+
+function attachChartTips(containerEl) {
+  containerEl.addEventListener('mousemove', (event) => {
+    const target = event.target.closest('[data-tip]');
+    if (!target) {
+      chartTipEl.hidden = true;
+      return;
+    }
+    showTip(target.getAttribute('data-tip'), event.clientX, event.clientY);
+  });
+  containerEl.addEventListener('mouseleave', () => {
+    chartTipEl.hidden = true;
+  });
 }
 
 function renderChanges(el, rows, { linked = false } = {}) {
@@ -301,7 +427,10 @@ async function loadDashboard() {
     renderActiveChart(data.runs || []);
     renderSourceChart(data.sources || []);
     renderFitChart(data.fitSeries || []);
-    renderTopRoles(data.topRoles || []);
+    allRoles = data.roles || [];
+    renderTopRoles(allRoles);
+    setupRolesControls(data.sources || []);
+    renderRolesTable();
     renderChanges(recentAddsEl, data.recentAdds || [], { linked: true });
     renderChanges(recentCancelsEl, data.recentCancels || []);
   } catch (error) {
