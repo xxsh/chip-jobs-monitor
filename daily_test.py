@@ -13,11 +13,14 @@ import daily
 
 class DailyTests(unittest.TestCase):
     def test_partition_diff(self):
-        previous = [{"id": 1, "jr": "JR1", "name": "A"}, {"id": 2, "jr": "JR2", "name": "B"}]
+        previous = [
+            {"id": 1, "jr": "JR1", "name": "A", "link": "https://jobs/1"},
+            {"id": 2, "jr": "JR2", "name": "B"},
+        ]
         current = [{"id": 2, "jr": "JR2", "name": "B"}, {"id": 3, "jr": "JR3", "name": "C"}]
         diff = daily.partition_diff(current, previous)
         self.assertEqual([j["jr"] for j in diff["newJobs"]], ["JR3"])
-        self.assertEqual(diff["canceledJobs"], [{"jr": "JR1", "title": "A"}])
+        self.assertEqual(diff["canceledJobs"], [{"jr": "JR1", "title": "A", "link": "https://jobs/1"}])
 
     def test_job_key_stable_with_id(self):
         self.assertEqual(daily.job_key({"id": 42, "jr": "JR42", "name": "X"}), "42")
@@ -367,7 +370,11 @@ class DailyTests(unittest.TestCase):
         digest = daily.render_telegram_digest(
             {
                 "date": "2026-04-26", "location": "Shanghai, China", "currentJobCount": 147, "addedCount": 0,
-                "canceledCount": 2, "canceledJobs": [{"jr": "JR-X", "title": "removed A"}, {"jr": "JR-Y", "title": "removed B"}],
+                "canceledCount": 2,
+                "canceledJobs": [
+                    {"jr": "JR-X", "title": "removed A", "link": "https://x/removed-a"},
+                    {"jr": "JR-Y", "title": "removed B"},
+                ],
                 "profileHighlights": [], "baselineCreated": False,
                 "fitSummary": {"strongFit": 0, "goodFit": 0, "possibleStretch": 0, "lowFit": 0}, "rankedJobs": [],
             }
@@ -375,6 +382,8 @@ class DailyTests(unittest.TestCase):
         self.assertRegex(digest, r"No new jobs today")
         self.assertRegex(digest, r"❌ Canceled \(2\)")
         self.assertRegex(digest, r"removed A")
+        self.assertRegex(digest, r"https://x/removed-a")
+        self.assertNotRegex(digest, r"None")
         self.assertLess(len(digest), 500)
 
     def test_telegram_backfill_first_seen(self):
@@ -442,7 +451,7 @@ class DailyTests(unittest.TestCase):
             "date": "2026-05-23", "location": "Shanghai, China", "baselineCreated": False,
             "addedCount": 2, "canceledCount": 1, "rankedJobCount": 2, "backlogCount": 0,
             "deferredScoreCount": 0, "scoreErrorCount": 0, "currentJobCount": 100,
-            "canceledJobs": [{"jr": "JRX", "title": "Old role"}],
+            "canceledJobs": [{"jr": "JRX", "title": "Old role", "link": "https://n/old"}],
             "rankedJobs": [
                 {"jr": "JR1", "title": "ASIC Eng", "score": 78, "suitability": "Strong fit", "recommendation": "Apply", "link": "https://n/1", "verdict": "Great match.", "firstSeenDate": "2026-05-23"},
                 {"jr": "JR2", "title": "Intern role", "score": 0, "suitability": "Low fit", "recommendation": "Skip", "link": "https://n/2", "verdict": "Intern."},
@@ -471,7 +480,7 @@ class DailyTests(unittest.TestCase):
         self.assertRegex(md, r"## AMD \(\+0, 0 scored, -0\)")
         self.assertRegex(md, r"\[JR1\] ASIC Eng")
         self.assertRegex(md, r"Baseline established today")
-        self.assertRegex(md, r"\*\*Canceled:\*\* \[JRX\] Old role")
+        self.assertRegex(md, r"\*\*Canceled:\*\*\n- \[JRX\] Old role — https://n/old")
 
     def test_render_grouped_telegram(self):
         tg = daily.render_grouped_telegram(self._grouped())
@@ -479,9 +488,11 @@ class DailyTests(unittest.TestCase):
         self.assertRegex(tg, r"🦀 Jobs — Shanghai, China — 2026-05-23")
         self.assertRegex(tg, r"=== NVIDIA \(\+2\) ===")
         self.assertRegex(tg, r"=== AMD ===")  # baseline section
-        self.assertRegex(tg, r"🟢 \[JR1\] ASIC Eng \(78\) · Apply")
-        self.assertRegex(tg, r"⚪️ Skip \(1\): JR2")
-        self.assertRegex(tg, r"❌ Canceled \(1\): JRX")
+        self.assertRegex(tg, r"1\. 🟢 \[JR1\] ASIC Eng\n   Strong fit \(78\) · Apply · added 2026-05-23")
+        self.assertRegex(tg, r"⚪️ Skip \(1\):\n• \[JR2\] Intern role")
+        self.assertRegex(tg, r"❌ Canceled \(1\):\n• \[JRX\] Old role")
+        self.assertNotRegex(tg, r"Intern role\n  https://n/2")
+        self.assertNotRegex(tg, r"Old role\n  https://n/old")
 
     def test_build_grouped_totals(self):
         grouped = self._grouped()
@@ -490,17 +501,109 @@ class DailyTests(unittest.TestCase):
         self.assertEqual(rebuilt["totals"]["addedCount"], 2)
         self.assertEqual(rebuilt["totals"]["currentJobCount"], 140)
 
+    def test_render_grouped_telegram_shows_no_changes_and_failures(self):
+        grouped = {
+            "date": "2026-05-25",
+            "location": "Shanghai, China",
+            "entries": [
+                {
+                    "source": "arm",
+                    "display": "Arm",
+                    "status": "ok",
+                    "report": {
+                        "addedCount": 0,
+                        "rankedJobCount": 0,
+                        "canceledCount": 0,
+                        "baselineCreated": False,
+                        "rankedJobs": [],
+                        "canceledJobs": [],
+                    },
+                },
+                {
+                    "source": "nvidia",
+                    "display": "NVIDIA",
+                    "status": "error",
+                    "error": "Browser executable missing",
+                },
+            ],
+            "sources": [],
+            "totals": {
+                "currentJobCount": 0,
+                "addedCount": 0,
+                "rankedJobCount": 0,
+                "canceledCount": 0,
+                "failedSourceCount": 1,
+            },
+        }
+
+        tg = daily.render_grouped_telegram(grouped)
+
+        self.assertRegex(tg, r"0 active · \+0 added · 0 scored · -0 canceled · 1 failed")
+        self.assertRegex(tg, r"=== Arm ===\n✅ Success: no changes\.")
+        self.assertRegex(tg, r"=== NVIDIA ===\n❌ Fetch failed: Browser executable missing")
+
+    def test_main_records_source_failures_without_aborting(self):
+        original_enabled_sources = daily.enabled_sources
+        original_run_one_source = daily.run_one_source
+        original_acquire_run_lock = daily.acquire_run_lock
+        original_ensure_dir = daily.ensure_dir
+        original_remove_latest_report_files = daily.remove_latest_report_files
+        original_write_grouped = daily.write_grouped
+        released = []
+        attempted = []
+        written = []
+
+        def fake_run_one_source(source, seed=False):
+            attempted.append(source)
+            if source == "nvidia":
+                raise RuntimeError("browser missing")
+            return {
+                "currentJobCount": 1,
+                "addedCount": 0,
+                "rankedJobCount": 0,
+                "canceledCount": 0,
+                "backlogCount": 0,
+                "deferredScoreCount": 0,
+                "scoreErrorCount": 0,
+            }
+
+        try:
+            daily.enabled_sources = lambda: ["nvidia", "amd"]
+            daily.run_one_source = fake_run_one_source
+            daily.acquire_run_lock = lambda: lambda: released.append(None)
+            daily.ensure_dir = lambda path: None
+            daily.remove_latest_report_files = lambda: None
+            daily.write_grouped = written.append
+
+            daily.main()
+
+            self.assertEqual(attempted, ["nvidia", "amd"])
+            self.assertEqual(released, [None])
+            self.assertEqual([(e["source"], e["status"]) for e in written[0]["entries"]], [
+                ("nvidia", "error"),
+                ("amd", "ok"),
+            ])
+            self.assertEqual([e["source"] for e in written[0]["sources"]], ["amd"])
+            self.assertEqual(written[0]["totals"]["failedSourceCount"], 1)
+        finally:
+            daily.enabled_sources = original_enabled_sources
+            daily.run_one_source = original_run_one_source
+            daily.acquire_run_lock = original_acquire_run_lock
+            daily.ensure_dir = original_ensure_dir
+            daily.remove_latest_report_files = original_remove_latest_report_files
+            daily.write_grouped = original_write_grouped
+
     def test_render_markdown_canceled_section(self):
         md = daily.render_markdown(
             {
                 "date": "2026-04-30", "currentJobCount": 100, "addedCount": 0, "canceledCount": 1,
-                "canceledJobs": [{"jr": "JR-X", "title": "Removed role"}], "profileHighlights": [],
+                "canceledJobs": [{"jr": "JR-X", "title": "Removed role", "link": "https://x/removed"}], "profileHighlights": [],
                 "baselineCreated": False, "rankedJobCount": 0,
                 "fitSummary": {"strongFit": 0, "goodFit": 0, "possibleStretch": 0, "lowFit": 0}, "rankedJobs": [],
             }
         )
         self.assertRegex(md, r"## Canceled")
-        self.assertRegex(md, r"\[JR-X\] Removed role")
+        self.assertRegex(md, r"\[JR-X\] Removed role — https://x/removed")
 
 
 if __name__ == "__main__":

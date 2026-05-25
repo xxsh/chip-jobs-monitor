@@ -279,11 +279,14 @@ def partition_diff(current_jobs, previous_jobs):
     previous_ids = {job_key(job) for job in previous_jobs}
     current_ids = {job_key(job) for job in current_jobs}
     new_jobs = [job for job in current_jobs if job_key(job) not in previous_ids]
-    canceled = [
-        {"jr": job.get("jr"), "title": job.get("name")}
-        for job in previous_jobs
-        if job_key(job) not in current_ids
-    ]
+    canceled = []
+    for job in previous_jobs:
+        if job_key(job) in current_ids:
+            continue
+        removed = {"jr": job.get("jr"), "title": job.get("name")}
+        if job.get("link"):
+            removed["link"] = job["link"]
+        canceled.append(removed)
     canceled.sort(key=lambda c: _title_key(c["title"]))
     return {"newJobs": new_jobs, "canceledJobs": canceled}
 
@@ -493,7 +496,7 @@ def render_markdown(report):
         if report["canceledJobs"]:
             md += "\n## Canceled\n"
             for j in report["canceledJobs"]:
-                md += f"- [{j['jr']}] {j['title']}\n"
+                md += markdown_job_line(j) + "\n"
         return md
 
     md += f"- Strong fit: {report['fitSummary']['strongFit']}\n"
@@ -527,7 +530,7 @@ def render_markdown(report):
     if report["canceledJobs"]:
         md += "\n## Canceled\n"
         for j in report["canceledJobs"]:
-            md += f"- [{j['jr']}] {j['title']}\n"
+            md += markdown_job_line(j) + "\n"
 
     return md
 
@@ -592,7 +595,7 @@ def render_telegram_digest(report):
             lines.append("")
             lines.append(f"❌ Canceled ({len(report['canceledJobs'])}):")
             for c in report["canceledJobs"][:10]:
-                lines.append(f"• [{c['jr']}] {c['title']}")
+                lines.append(telegram_job_chunk(c).lstrip("\n"))
         return "\n".join(lines)
 
     f = report["fitSummary"]
@@ -630,13 +633,13 @@ def render_telegram_digest(report):
         header = f"\n\n⚪️ Skip ({len(skip_pile)}):"
         if try_append(header):
             for j in skip_pile:
-                try_append(f"\n• [{j['jr']}] {j['title']}{f' · added {j['firstSeenDate']}' if j.get('firstSeenDate') else ''}")
+                try_append(telegram_job_chunk(j, include_added=True))
 
     if report["canceledJobs"]:
         header = f"\n\n❌ Canceled ({len(report['canceledJobs'])}):"
         if try_append(header):
             for c in report["canceledJobs"][:8]:
-                try_append(f"\n• [{c['jr']}] {c['title']}")
+                try_append(telegram_job_chunk(c))
 
     if body["truncated"] > 0:
         body["text"] += (
@@ -802,10 +805,14 @@ def _registry():
     return sources.SOURCES
 
 
+def parse_source_list(value):
+    return [s.strip() for s in value.split(",") if s.strip()]
+
+
 def enabled_sources():
     env = os.environ.get("MONITOR_SOURCES")
     if env:
-        return [s.strip() for s in env.split(",") if s.strip()]
+        return parse_source_list(env)
     return ["nvidia", *sorted(_registry().keys())]
 
 
@@ -923,25 +930,72 @@ def build_grouped(results):
         "currentJobCount", "addedCount", "canceledCount", "rankedJobCount",
         "backlogCount", "deferredScoreCount", "scoreErrorCount",
     )
-    totals = {k: sum((r["report"].get(k) or 0) for r in results) for k in keys}
-    return {"date": SNAPSHOT_LABEL, "location": LOCATION, "sources": results, "totals": totals}
+    successful = [r for r in results if r.get("status", "ok") == "ok" and r.get("report") is not None]
+    totals = {k: sum((r["report"].get(k) or 0) for r in successful) for k in keys}
+    totals["failedSourceCount"] = len([r for r in results if r.get("status") == "error"])
+    return {
+        "date": SNAPSHOT_LABEL,
+        "location": LOCATION,
+        "entries": results,
+        "sources": successful,
+        "totals": totals,
+    }
+
+
+def grouped_entries(grouped):
+    return grouped.get("entries") or grouped.get("sources") or []
+
+
+def short_error(error, limit=180):
+    text = re.sub(r"\s+", " ", str(error)).strip()
+    return _u16slice(text, limit - 1) + "…" if _u16len(text) > limit else text
+
+
+def job_display_name(job):
+    jr = job.get("jr") or job.get("id") or "unknown"
+    title = job.get("title") or job.get("name") or "(untitled)"
+    return f"[{jr}] {title}"
+
+
+def markdown_job_line(job):
+    link = job.get("link")
+    return f"- {job_display_name(job)}" + (f" — {link}" if link else "")
+
+
+def telegram_job_chunk(job, include_added=False, include_link=True):
+    added = f" · added {job['firstSeenDate']}" if include_added and job.get("firstSeenDate") else ""
+    chunk = f"\n• {job_display_name(job)}{added}"
+    if include_link and job.get("link"):
+        chunk += f"\n  {job['link']}"
+    return chunk
 
 
 def render_grouped_markdown(grouped):
     t = grouped["totals"]
+    entries = grouped_entries(grouped)
+    failed_count = t.get("failedSourceCount") or len([e for e in entries if e.get("status") == "error"])
     md = f"# Daily jobs — {grouped['location']} — {grouped['date']}\n\n"
-    md += f"- Companies: {len(grouped['sources'])}\n"
+    if failed_count:
+        md += f"- Companies: {len(entries)} ({len(grouped.get('sources') or [])} succeeded, {failed_count} failed)\n"
+    else:
+        md += f"- Companies: {len(entries)}\n"
     md += (
         f"- Active: {t['currentJobCount']} · Added: {t['addedCount']} · "
         f"Scored: {t['rankedJobCount']} · Canceled: {t['canceledCount']}\n"
     )
-    for entry in grouped["sources"]:
+    for entry in entries:
+        if entry.get("status") == "error":
+            md += f"\n## {entry['display']} (failed)\n"
+            md += f"\n_Fetch failed:_ {short_error(entry.get('error', 'unknown error'), 300)}\n"
+            continue
         r = entry["report"]
         md += f"\n## {entry['display']} (+{r['addedCount']}, {r['rankedJobCount']} scored, -{r['canceledCount']})\n"
         if r.get("baselineCreated"):
             md += "\nBaseline established today.\n"
             continue
-        if not r["rankedJobs"]:
+        if not (r["addedCount"] or r["rankedJobCount"] or r["canceledCount"]):
+            md += "\n_No changes._\n"
+        elif not r["rankedJobs"]:
             md += "\n_No newly scored jobs._\n"
         for i, job in enumerate(r["rankedJobs"]):
             md += f"\n### {i + 1}. [{job['jr']}] {job['title']}\n"
@@ -952,16 +1006,24 @@ def render_grouped_markdown(grouped):
             if job.get("verdict"):
                 md += f"- Verdict: {job['verdict']}\n"
         if r["canceledJobs"]:
-            md += "\n**Canceled:** " + ", ".join(f"[{c['jr']}] {c['title']}" for c in r["canceledJobs"]) + "\n"
+            md += "\n**Canceled:**\n"
+            for canceled in r["canceledJobs"]:
+                md += markdown_job_line(canceled) + "\n"
     return md
 
 
 def render_grouped_telegram(grouped):
     t = grouped["totals"]
+    failed_count = t.get("failedSourceCount") or len([e for e in grouped_entries(grouped) if e.get("status") == "error"])
+    stats = (
+        f"{t['currentJobCount']} active · +{t['addedCount']} added · "
+        f"{t['rankedJobCount']} scored · -{t['canceledCount']} canceled"
+    )
+    if failed_count:
+        stats += f" · {failed_count} failed"
     lines = [
         f"🦀 Jobs — {grouped['location']} — {grouped['date']}",
-        f"{t['currentJobCount']} active · +{t['addedCount']} added · "
-        f"{t['rankedJobCount']} scored · -{t['canceledCount']} canceled",
+        stats,
     ]
     body = {"text": "", "truncated": 0}
 
@@ -972,7 +1034,10 @@ def render_grouped_telegram(grouped):
         body["text"] += chunk
         return True
 
-    for entry in grouped["sources"]:
+    for entry in grouped_entries(grouped):
+        if entry.get("status") == "error":
+            try_append(f"\n\n=== {entry['display']} ===\n❌ Fetch failed: {short_error(entry.get('error', 'unknown error'))}")
+            continue
         r = entry["report"]
         if r.get("baselineCreated"):
             try_append(f"\n\n=== {entry['display']} ===\nBaseline established.")
@@ -980,20 +1045,30 @@ def render_grouped_telegram(grouped):
         actionable = [j for j in r["rankedJobs"] if j.get("recommendation") != "Skip"]
         skip_pile = [j for j in r["rankedJobs"] if j.get("recommendation") == "Skip"]
         if not (actionable or skip_pile or r["canceledJobs"]):
+            if not (r["addedCount"] or r["rankedJobCount"] or r["canceledCount"]):
+                try_append(f"\n\n=== {entry['display']} ===\n✅ Success: no changes.")
+            else:
+                try_append(f"\n\n=== {entry['display']} (+{r['addedCount']}) ===\n✅ Success: no newly scored jobs.")
             continue
         if not try_append(f"\n\n=== {entry['display']} (+{r['addedCount']}) ==="):
             continue
         # Cap actionable items per company so one big day (e.g. a seed) can't crowd out other companies.
         for i, j in enumerate(actionable[:TELEGRAM_PER_COMPANY]):
-            head = f"\n{i + 1}. {fit_icon(j.get('suitability'))} [{j['jr']}] {j['title']} ({j['score']}) · {j['recommendation']}"
+            first_seen = f" · added {j['firstSeenDate']}" if j.get("firstSeenDate") else ""
+            head = f"\n\n{i + 1}. {fit_icon(j.get('suitability'))} [{j['jr']}] {j['title']}"
+            meta = f"\n   {j['suitability']} ({j['score']}) · {j['recommendation']}{first_seen}"
             verdict = f"\n   {first_sentence(j['verdict'], 140)}" if j.get("verdict") else ""
-            try_append(head + verdict + f"\n   {j['link']}")
+            try_append(head + meta + verdict + f"\n   {j['link']}")
         if len(actionable) > TELEGRAM_PER_COMPANY:
             try_append(f"\n   …+{len(actionable) - TELEGRAM_PER_COMPANY} more scored (see full report)")
         if skip_pile:
-            try_append(f"\n⚪️ Skip ({len(skip_pile)}): " + ", ".join(j["jr"] for j in skip_pile[:8]))
+            try_append(f"\n\n⚪️ Skip ({len(skip_pile)}):")
+            for skipped in skip_pile[:8]:
+                try_append(telegram_job_chunk(skipped, include_added=True, include_link=False))
         if r["canceledJobs"]:
-            try_append(f"\n❌ Canceled ({len(r['canceledJobs'])}): " + ", ".join(c["jr"] for c in r["canceledJobs"][:8]))
+            try_append(f"\n\n❌ Canceled ({len(r['canceledJobs'])}):")
+            for canceled in r["canceledJobs"][:8]:
+                try_append(telegram_job_chunk(canceled, include_link=False))
 
     if body["truncated"] > 0:
         body["text"] += f"\n\n…{body['truncated']} item(s) trimmed; see latest_{slugify(grouped['location'])}.md."
@@ -1034,9 +1109,15 @@ def main():
         for source in sources_list:
             try:
                 report = run_one_source(source, seed=(source in seed_set))
-                results.append({"source": source, "display": source_display(source), "report": report})
+                results.append({"source": source, "display": source_display(source), "status": "ok", "report": report})
             except Exception as error:  # noqa: BLE001 - one source failing must not kill the rest
                 print(f"WARN source '{source}' failed: {error}", file=sys.stderr)
+                results.append({
+                    "source": source,
+                    "display": source_display(source),
+                    "status": "error",
+                    "error": str(error),
+                })
 
         if not results:
             raise RuntimeError("all sources failed")
