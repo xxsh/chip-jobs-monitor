@@ -23,5 +23,17 @@ export MYSQL_USER="${MYSQL_USER:-root}"
 export MYSQL_SOCKET_PATH="${MYSQL_SOCKET_PATH:-/tmp/mysql.sock}"
 export MYSQL_DATABASE="${MYSQL_DATABASE:-nvidia_jobs_monitor}"
 
+if [[ -z "${NVIDIA_CHROMIUM_PATH:-}" ]]; then
+  for browser in \
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"; do
+    if [[ -x "$browser" ]]; then
+      export NVIDIA_CHROMIUM_PATH="$browser"
+      break
+    fi
+  done
+fi
+
 cd "$SCRIPT_DIR"
 exec env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY "$PYTHON_BIN" "$SCRIPT_DIR/daily.py"
