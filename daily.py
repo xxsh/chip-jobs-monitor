@@ -637,6 +637,7 @@ def build_report(
     source=None,
     profile_hash=None,
     ledger_jobs=None,
+    score_filter=None,
 ):
     if report_date is None:
         report_date = SNAPSHOT_LABEL
@@ -687,6 +688,13 @@ def build_report(
 
     skipped_intern_jobs = [build_skipped_intern_score(job) for job in score_candidates if is_intern_job(job)]
     model_score_candidates = [job for job in score_candidates if not is_intern_job(job)]
+    # Per-source policy filter (e.g. non-semi sources only score AI/data-related titles).
+    # Filtered-out jobs are still in the snapshot + MySQL — they just don't reach codex.
+    score_filtered_count = 0
+    if score_filter is not None:
+        before = len(model_score_candidates)
+        model_score_candidates = [job for job in model_score_candidates if score_filter(job)]
+        score_filtered_count = before - len(model_score_candidates)
     if max_scoring_jobs_per_run > 0:
         jobs_to_score = model_score_candidates[:max_scoring_jobs_per_run]
         deferred_jobs = model_score_candidates[max_scoring_jobs_per_run:]
@@ -730,6 +738,7 @@ def build_report(
         "fitSummary": summarize_fits(scored),
         "scoreCandidateCount": len(score_candidates),
         "modelScoreCandidateCount": len(model_score_candidates),
+        "scoreFilteredCount": score_filtered_count,
         "scoreLimit": max_scoring_jobs_per_run,
         "backlogCount": backlog_count,
         "deferredScoreCount": len(deferred_jobs),
@@ -873,6 +882,8 @@ def run_one_source(source, seed=False):
         raise RuntimeError(f"snapshot not found for {source} ({SNAPSHOT_LABEL})")
     current_jobs = load_snapshot(current_file)
     current_profile_hash = load_profile_hash()
+    import sources as _sources
+    score_filter = _sources.score_filter_for(source)
 
     if seed:
         report = build_report(
@@ -885,6 +896,7 @@ def run_one_source(source, seed=False):
             max_scoring_jobs_per_run=0,  # no per-run cap: score the whole backlog
             source=source,
             profile_hash=current_profile_hash,
+            score_filter=score_filter,
         )
         print(f"  {display}: seeding — scoring {report['rankedJobCount']} current openings", file=sys.stderr)
     else:
@@ -903,6 +915,7 @@ def run_one_source(source, seed=False):
             ledger_jobs=ledger_jobs,
             source=source,
             profile_hash=current_profile_hash,
+            score_filter=score_filter,
         )
     report_file = write_source_report(report, source)
 
