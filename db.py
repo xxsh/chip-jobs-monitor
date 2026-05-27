@@ -624,6 +624,74 @@ def upsert_cancellation(conn, source, location_slug, run_id, canceled):
         cur.execute(sql, params)
 
 
+def scored_keys(conn, *, source, profile_hash):
+    """job_keys already scored under (profile_hash, source) in resume_scores.
+
+    Single source of truth for "have we scored this job under the current
+    resume?" — drives the dedup in daily.py's L3 step. Errored/skipped scores
+    only land in resume_scores when they carry a non-null score and no error
+    (see persist_daily_run), so a key being present here means "don't re-score".
+    """
+    if not profile_hash:
+        return set()
+    sql = """
+      SELECT j.job_key
+      FROM resume_scores rs
+      JOIN jobs j ON j.id = rs.job_id
+      WHERE rs.profile_hash = %s AND rs.source = %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, [profile_hash, source])
+        rows = cur.fetchall()
+    return {row[0] for row in rows}
+
+
+def fetch_scores_for_keys(conn, *, source, profile_hash, job_keys):
+    """Map job_key -> score-shaped dict for keys present in resume_scores.
+
+    Returns the latest scoring detail under the current resume, in the shape the
+    renderers expect (matchedReasons, gapReasons, firstSeenDate, etc.). Callers
+    merge this with the in-memory current snapshot to assemble rankedJobs for L4.
+    """
+    if not profile_hash or not job_keys:
+        return {}
+    placeholders = ",".join(["%s"] * len(job_keys))
+    sql = f"""
+      SELECT j.job_key, rs.score, rs.suitability, rs.recommendation,
+             rs.matched_reasons, rs.gap_reasons, rs.verdict, rs.first_seen_date,
+             rs.matched_keywords, rs.selection_reasons, rs.raw_score
+      FROM resume_scores rs
+      JOIN jobs j ON j.id = rs.job_id
+      WHERE rs.profile_hash = %s AND rs.source = %s AND j.job_key IN ({placeholders})
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, [profile_hash, source, *job_keys])
+        rows = cur.fetchall()
+
+    out = {}
+    for row in rows:
+        key, score, suitability, recommendation, matched, gap, verdict, first_seen, matched_kw, sel_reasons, raw = row
+        # raw_score holds the original scoring payload — pull skippedReason / error from there
+        # so we don't lose them across the ledger round-trip.
+        try:
+            raw_obj = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else (raw or {})
+        except (ValueError, TypeError):
+            raw_obj = {}
+        out[key] = {
+            "score": score,
+            "suitability": suitability,
+            "recommendation": recommendation,
+            "matchedReasons": json.loads(matched) if isinstance(matched, (str, bytes, bytearray)) else (matched or []),
+            "gapReasons": json.loads(gap) if isinstance(gap, (str, bytes, bytearray)) else (gap or []),
+            "verdict": verdict,
+            "firstSeenDate": first_seen.isoformat() if hasattr(first_seen, "isoformat") else first_seen,
+            "matchedKeywords": json.loads(matched_kw) if isinstance(matched_kw, (str, bytes, bytearray)) else (matched_kw or []),
+            "selectionReasons": json.loads(sel_reasons) if isinstance(sel_reasons, (str, bytes, bytearray)) else (sel_reasons or []),
+            "skippedReason": raw_obj.get("skippedReason"),
+        }
+    return out
+
+
 def persist_daily_run(
     conn,
     *,
@@ -709,7 +777,10 @@ def persist_daily_run_from_env(
     profile_cache_path=None,
 ):
     if not has_mysql_config():
-        return {"skipped": True, "reason": "mysql-not-configured"}
+        raise RuntimeError(
+            "MySQL is required for the daily run (ledger is the source of truth for scored jobs). "
+            "Set MYSQL_USER/MYSQL_SOCKET_PATH or MYSQL_DSN."
+        )
     ensure_database_and_schema_from_env()
     conn = create_mysql_connection_from_env()
     try:

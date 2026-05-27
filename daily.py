@@ -223,30 +223,6 @@ def load_snapshot_history(current_label=None, source=None):
     ]
 
 
-def load_dated_reports(current_label=None, source=None):
-    if current_label is None:
-        current_label = SNAPSHOT_LABEL
-    slug = slugify(LOCATION)
-    pattern = re.compile(rf"^(\d{{4}}-\d{{2}}-\d{{2}})_{re.escape(_source_infix(source))}{slug}\.json$")
-    if not os.path.exists(REPORT_DIR):
-        return []
-    entries = []
-    for file in os.listdir(REPORT_DIR):
-        match = pattern.match(file)
-        if not match:
-            continue
-        label = match.group(1)
-        if is_date_label(current_label) and label > current_label:
-            continue
-        full_path = os.path.join(REPORT_DIR, file)
-        try:
-            entries.append({"label": label, "file": full_path, "report": _load_json(full_path)})
-        except (OSError, ValueError):
-            continue
-    entries.sort(key=lambda e: e["label"])
-    return entries
-
-
 def load_profile_highlights():
     if not os.path.exists(PROFILE_CACHE):
         return []
@@ -416,37 +392,6 @@ def build_first_seen_by_key(snapshot_history):
                 first_seen[key] = entry["label"]
         previous_jobs = entry.get("jobs") or []
     return first_seen
-
-
-def collect_successful_score_keys(report_entries, current_profile_hash=None):
-    """Keys of jobs already successfully scored under the *current* profile.
-
-    When the resume changes, profile_latest.json's resumeHash changes; reports
-    stamped with a different profileHash are then ignored here, so their jobs
-    become eligible for re-scoring under the new resume (capped per run, so the
-    backlog converges over a few days rather than in one expensive batch).
-
-    Reports with no profileHash — written before profile-aware convergence, or
-    when there is no profile pointer — are treated as matching, to avoid a
-    full-backlog re-score storm on legacy data; use the manual full rescore
-    (`npm run rescore:import`) to refresh those at once.
-    """
-    successful = set()
-    for entry in report_entries or []:
-        report = entry.get("report") if isinstance(entry, dict) and "report" in entry else entry
-        report_hash = report.get("profileHash") if isinstance(report, dict) else None
-        if current_profile_hash and report_hash and report_hash != current_profile_hash:
-            continue
-        scored_jobs = []
-        if isinstance(report.get("rankedJobs"), list):
-            scored_jobs.extend(report["rankedJobs"])
-        if isinstance(report.get("newJobs"), list):
-            scored_jobs.extend(report["newJobs"])
-        for scored in scored_jobs:
-            if not scored or scored.get("error"):
-                continue
-            successful.add(job_key(scored))
-    return successful
 
 
 def attach_scoring_dates(scored_jobs, source_jobs):
@@ -651,6 +596,34 @@ def render_telegram_digest(report):
     return _u16slice(out, TELEGRAM_LIMIT - 1) + "…" if _u16len(out) > TELEGRAM_LIMIT else out
 
 
+def project_ledger_jobs(current_jobs, key_to_score):
+    """Shape MySQL-resident scores into rankedJobs entries using today's snapshot metadata.
+
+    fetch_scores_for_keys only returns score-side fields (score, verdict, …); the
+    title/link/locations come from the active snapshot row. Jobs not present in
+    the ledger (key_to_score) are skipped — they belong to the L3 scoring path.
+    """
+    if not key_to_score:
+        return []
+    out = []
+    for job in current_jobs:
+        key = job_key(job)
+        score_data = key_to_score.get(key)
+        if score_data is None:
+            continue
+        out.append({
+            "jr": job.get("jr"),
+            "id": job.get("id"),
+            "title": job.get("name") or job.get("title"),
+            "link": job.get("link"),
+            "locations": job.get("locations"),
+            "department": job.get("department"),
+            "posted": job.get("datePosted") or job.get("postedTs"),
+            **score_data,
+        })
+    return out
+
+
 def build_report(
     *,
     current_jobs,
@@ -663,6 +636,7 @@ def build_report(
     score_fn=run_scorer,
     source=None,
     profile_hash=None,
+    ledger_jobs=None,
 ):
     if report_date is None:
         report_date = SNAPSHOT_LABEL
@@ -721,9 +695,22 @@ def build_report(
         deferred_jobs = []
 
     scored_by_model = attach_scoring_dates(score_fn(jobs_to_score), jobs_to_score)
-    scored = sort_scored([*scored_by_model, *skipped_intern_jobs])
-    backlog_count = len([j for j in scored if j.get("firstSeenDate") and j["firstSeenDate"] != report_date])
-    score_error_count = len([j for j in scored if j.get("error")])
+    fresh_jobs = [*scored_by_model, *skipped_intern_jobs]
+    fresh_keys = {job_key(j) for j in fresh_jobs}
+    # Digest = today's diff vs yesterday. Restrict both fresh (this run's LLM work) and
+    # historical (ledger pre-fills) to firstSeenDate == today. Backlog catch-ups scored
+    # this run still advance MySQL and appear in the full markdown report, but they are
+    # not "today's change" and don't surface in the Telegram digest — same-day re-runs
+    # must produce a stable digest, which requires excluding any fresh-vs-ledger drift
+    # on non-today entries.
+    todays_fresh = [j for j in fresh_jobs if j.get("firstSeenDate") == report_date]
+    todays_ledger = [
+        j for j in (ledger_jobs or [])
+        if j.get("firstSeenDate") == report_date and job_key(j) not in fresh_keys
+    ]
+    scored = sort_scored([*todays_fresh, *todays_ledger])
+    backlog_count = len([j for j in fresh_jobs if j.get("firstSeenDate") and j["firstSeenDate"] != report_date])
+    score_error_count = len([j for j in fresh_jobs if j.get("error")])
     scored_dates = sorted({j["firstSeenDate"] for j in scored if j.get("firstSeenDate")})
     deferred_dates = sorted({j["firstSeenDate"] for j in deferred_jobs if j.get("firstSeenDate")})
 
@@ -846,6 +833,31 @@ def fetch_source(source):
     print(f"  {source_display(source)}: fetched {len(jobs)} jobs", file=sys.stderr)
 
 
+def _load_ledger_state(source, current_jobs, profile_hash):
+    """Pre-scoring read of the MySQL ledger: (already-scored keys, projected ledger jobs).
+
+    Opens a short-lived connection — we don't hold it across the LLM calls that
+    can take minutes per job. Persistence later opens its own connection.
+    """
+    import db
+
+    if not profile_hash:
+        return set(), []
+    db.ensure_database_and_schema_from_env()
+    conn = db.create_mysql_connection_from_env()
+    try:
+        successful = db.scored_keys(conn, source=source, profile_hash=profile_hash)
+        score_data = db.fetch_scores_for_keys(
+            conn,
+            source=source,
+            profile_hash=profile_hash,
+            job_keys=[job_key(job) for job in current_jobs],
+        )
+    finally:
+        conn.close()
+    return successful, project_ledger_jobs(current_jobs, score_data)
+
+
 def run_one_source(source, seed=False):
     """Full per-source pipeline: fetch -> diff -> score -> per-source report -> persist. Returns the report.
 
@@ -881,47 +893,38 @@ def run_one_source(source, seed=False):
         history = load_snapshot_history(SNAPSHOT_LABEL, source)
         if not is_date_label(SNAPSHOT_LABEL) and not any(e["label"] == SNAPSHOT_LABEL for e in history):
             history = [*history, {"label": SNAPSHOT_LABEL, "file": current_file, "jobs": current_jobs}]
-        successful = collect_successful_score_keys(
-            load_dated_reports(SNAPSHOT_LABEL, source), current_profile_hash
-        )
+        successful, ledger_jobs = _load_ledger_state(source, current_jobs, current_profile_hash)
         report = build_report(
             current_jobs=current_jobs,
             previous_jobs=previous_jobs,
             previous_snapshot_file=previous_file,
             snapshot_history=history,
             successful_score_keys=successful,
+            ledger_jobs=ledger_jobs,
             source=source,
             profile_hash=current_profile_hash,
         )
     report_file = write_source_report(report, source)
 
     if is_date_label(SNAPSHOT_LABEL):
-        try:
-            import db
+        import db
 
-            persisted = db.persist_daily_run_from_env(
-                source=source,
-                location=LOCATION,
-                run_date=SNAPSHOT_LABEL,
-                current_jobs=current_jobs,
-                report=report,
-                snapshot_file=current_file,
-                report_file=report_file,
-                profile_cache_path=PROFILE_CACHE,
-            )
-            if persisted.get("skipped"):
-                print(f"  {display}: MySQL persistence skipped (set MYSQL_USER/MYSQL_SOCKET_PATH).", file=sys.stderr)
-            else:
-                print(
-                    f"  {display}: persisted run {persisted['run_id']} — "
-                    f"{persisted['job_snapshots']} snapshots, {persisted['scores']} scores "
-                    f"({persisted.get('resume_scores', 0)} → current resume).",
-                    file=sys.stderr,
-                )
-        except Exception as error:  # noqa: BLE001 - persistence failures shouldn't drop the report
-            if os.environ.get("NVIDIA_DB_REQUIRED") == "1":
-                raise
-            print(f"  {display}: WARN MySQL persistence failed: {error}", file=sys.stderr)
+        persisted = db.persist_daily_run_from_env(
+            source=source,
+            location=LOCATION,
+            run_date=SNAPSHOT_LABEL,
+            current_jobs=current_jobs,
+            report=report,
+            snapshot_file=current_file,
+            report_file=report_file,
+            profile_cache_path=PROFILE_CACHE,
+        )
+        print(
+            f"  {display}: persisted run {persisted['run_id']} — "
+            f"{persisted['job_snapshots']} snapshots, {persisted['scores']} scores "
+            f"({persisted.get('resume_scores', 0)} → current resume).",
+            file=sys.stderr,
+        )
     return report
 
 

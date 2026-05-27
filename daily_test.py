@@ -166,11 +166,13 @@ class DailyTests(unittest.TestCase):
             ],
             successful_score_keys=set(), report_date="2026-05-03", score_fn=fake,
         )
+        # L3 still scores the backlog (JR2 first seen yesterday, unscored until now)
+        # so the ledger advances. But the L4 digest is today-only: only JR3 surfaces.
         self.assertEqual([f"{j['jr']}:{j['firstSeenDate']}" for j in received["jobs"]], ["JR2:2026-05-02", "JR3:2026-05-03"])
         self.assertEqual(report["addedCount"], 1)
         self.assertEqual(report["backlogCount"], 1)
-        self.assertEqual(report["scoredDates"], ["2026-05-02", "2026-05-03"])
-        self.assertEqual([f"{j['jr']}:{j['firstSeenDate']}" for j in report["rankedJobs"]], ["JR2:2026-05-02", "JR3:2026-05-03"])
+        self.assertEqual(report["scoredDates"], ["2026-05-03"])
+        self.assertEqual([f"{j['jr']}:{j['firstSeenDate']}" for j in report["rankedJobs"]], ["JR3:2026-05-03"])
 
     def test_build_report_defers_excess(self):
         day1 = [{"id": 1, "jr": "JR1", "name": "Old"}]
@@ -205,39 +207,6 @@ class DailyTests(unittest.TestCase):
         self.assertEqual(report["deferredDates"], ["2026-05-02"])
         self.assertRegex(daily.render_telegram_digest(report), r"2 queued")
 
-    def test_collect_successful_score_keys(self):
-        keys = daily.collect_successful_score_keys(
-            [
-                {
-                    "report": {
-                        "rankedJobs": [
-                            {"id": 1, "jr": "JR1", "title": "Good", "score": 72},
-                            {"id": 2, "jr": "JR2", "title": "Failed", "score": 0, "error": "401 Unauthorized"},
-                        ]
-                    }
-                }
-            ]
-        )
-        self.assertIn(daily.job_key({"id": 1}), keys)
-        self.assertNotIn(daily.job_key({"id": 2}), keys)
-
-    def test_collect_successful_score_keys_profile_aware(self):
-        entries = [
-            {"report": {"profileHash": "hashA", "rankedJobs": [{"id": 1, "score": 70}]}},
-            {"report": {"profileHash": "hashB", "rankedJobs": [{"id": 2, "score": 70}]}},
-            {"report": {"rankedJobs": [{"id": 3, "score": 70}]}},  # legacy, no hash
-        ]
-        # Current resume == hashA: only same-hash + legacy(no-hash) count as handled.
-        keys = daily.collect_successful_score_keys(entries, "hashA")
-        self.assertIn(daily.job_key({"id": 1}), keys)
-        self.assertNotIn(daily.job_key({"id": 2}), keys)  # scored under a different resume -> re-score
-        self.assertIn(daily.job_key({"id": 3}), keys)  # legacy reports treated as matching
-        # No current hash -> profile-blind (original behavior): everything counts.
-        self.assertEqual(
-            daily.collect_successful_score_keys(entries),
-            {daily.job_key({"id": i}) for i in (1, 2, 3)},
-        )
-
     def test_build_report_stamps_profile_hash(self):
         report = daily.build_report(
             current_jobs=[{"id": 1, "jr": "JR1", "name": "Old"}], previous_jobs=[],
@@ -246,24 +215,124 @@ class DailyTests(unittest.TestCase):
         self.assertEqual(report["profileHash"], "hashA")
 
     def test_build_report_rescores_on_profile_change(self):
-        # A job successfully scored under the old resume is NOT in the current
-        # profile's handled set, so it gets re-scored under the new resume.
+        # The caller (run_one_source) derives successful_score_keys from db.scored_keys()
+        # filtered by the current profile_hash. Under a *new* resume, the prior profile's
+        # ledger rows are not returned, so the new build_report sees an empty handled set
+        # and the previously-scored job becomes a candidate.
         day1 = [{"id": 1, "jr": "JR1", "name": "Old"}]
         day2 = [*day1, {"id": 2, "jr": "JR2", "name": "Scored under resume A", "link": "https://x", "locations": ["China, Shanghai"]}]
-        prior_reports = [{"report": {"profileHash": "hashA", "rankedJobs": [{"id": 2, "jr": "JR2", "score": 60}]}}]
         received = {}
 
         def fake(jobs):
             received["jobs"] = jobs
             return []
 
-        new_hash_keys = daily.collect_successful_score_keys(prior_reports, "hashB")
         daily.build_report(
             current_jobs=day2, previous_jobs=day1, previous_snapshot_file="/tmp/2026-05-01.json",
             snapshot_history=[{"label": "2026-05-01", "jobs": day1}, {"label": "2026-05-02", "jobs": day2}],
-            successful_score_keys=new_hash_keys, score_fn=fake, profile_hash="hashB",
+            successful_score_keys=set(),  # new profile: nothing scored under it yet
+            score_fn=fake, profile_hash="hashB",
         )
         self.assertEqual([j["jr"] for j in received["jobs"]], ["JR2"])
+
+    def test_project_ledger_jobs_merges_snapshot_metadata(self):
+        # fetch_scores_for_keys returns only score-side fields. project_ledger_jobs
+        # merges them with today's snapshot to produce rankedJobs-shaped entries.
+        current = [
+            {"id": 1, "jr": "JR1", "name": "Old", "link": "https://x/1", "locations": ["China, Shanghai"]},
+            {"id": 2, "jr": "JR2", "name": "Unscored", "link": "https://x/2"},
+        ]
+        key_to_score = {
+            "1": {
+                "score": 82, "suitability": "Strong fit", "recommendation": "Apply",
+                "matchedReasons": ["m"], "gapReasons": [], "verdict": "v",
+                "firstSeenDate": "2026-05-01",
+            }
+        }
+        ledger = daily.project_ledger_jobs(current, key_to_score)
+        self.assertEqual(len(ledger), 1)  # only key '1' is in the ledger
+        self.assertEqual(ledger[0]["jr"], "JR1")
+        self.assertEqual(ledger[0]["title"], "Old")
+        self.assertEqual(ledger[0]["link"], "https://x/1")
+        self.assertEqual(ledger[0]["score"], 82)
+        self.assertEqual(ledger[0]["firstSeenDate"], "2026-05-01")
+
+    def test_build_report_ledger_job_today_appears(self):
+        # Same-day re-run: 1st run scored JR1 today (now in ledger via MySQL).
+        # 2nd run scores nothing new but the digest must still surface JR1
+        # because it was added today.
+        day1 = [{"id": 1, "jr": "JR1", "name": "Pre-existing"}]
+        day2 = [*day1, {"id": 2, "jr": "JR2", "name": "Added today", "link": "https://x/2"}]
+        ledger_jobs = [{
+            "jr": "JR2", "id": 2, "title": "Added today", "link": "https://x/2",
+            "score": 88, "suitability": "Strong fit", "recommendation": "Apply",
+            "matchedReasons": [], "gapReasons": [], "verdict": "v",
+            "firstSeenDate": "2026-05-02",  # == report_date below
+        }]
+        report = daily.build_report(
+            current_jobs=day2, previous_jobs=day1, previous_snapshot_file="/tmp/2026-05-01.json",
+            snapshot_history=[{"label": "2026-05-01", "jobs": day1}, {"label": "2026-05-02", "jobs": day2}],
+            successful_score_keys={daily.job_key({"id": 2})},
+            ledger_jobs=ledger_jobs,
+            report_date="2026-05-02",
+            score_fn=lambda jobs: [],
+        )
+        self.assertEqual(report["rankedJobCount"], 1)
+        self.assertEqual(report["rankedJobs"][0]["jr"], "JR2")
+        self.assertEqual(report["rankedJobs"][0]["score"], 88)
+
+    def test_build_report_ledger_job_old_hidden(self):
+        # An active job first seen days ago (already in MySQL ledger) must NOT appear
+        # in today's digest — the digest is today vs yesterday, not cumulative.
+        day1 = [{"id": 1, "jr": "JR1", "name": "Old role"}]
+        day2 = day1  # nothing new today
+        ledger_jobs = [{
+            "jr": "JR1", "id": 1, "title": "Old role", "link": "https://x/1",
+            "score": 90, "suitability": "Strong fit", "recommendation": "Apply",
+            "matchedReasons": [], "gapReasons": [], "verdict": "v",
+            "firstSeenDate": "2026-05-01",  # < report_date
+        }]
+        report = daily.build_report(
+            current_jobs=day2, previous_jobs=day1, previous_snapshot_file="/tmp/2026-05-01.json",
+            snapshot_history=[{"label": "2026-05-01", "jobs": day1}, {"label": "2026-05-02", "jobs": day2}],
+            successful_score_keys={daily.job_key({"id": 1})},
+            ledger_jobs=ledger_jobs,
+            report_date="2026-05-02",
+            score_fn=lambda jobs: [],
+        )
+        self.assertEqual(report["rankedJobCount"], 0)
+        self.assertEqual(report["addedCount"], 0)
+
+    def test_build_report_fresh_score_wins_over_ledger(self):
+        # If a job is both freshly scored this run AND in the ledger (shouldn't
+        # normally happen — successful_score_keys would have filtered it — but
+        # the merge must be deterministic), the fresh result wins.
+        day1 = []
+        day2 = [{"id": 1, "jr": "JR1", "name": "X", "link": "https://x/1"}]
+        ledger_jobs = [{
+            "jr": "JR1", "id": 1, "title": "X", "link": "https://x/1",
+            "score": 50, "suitability": "Possible stretch", "recommendation": "Maybe",
+            "matchedReasons": [], "gapReasons": [], "verdict": "old", "firstSeenDate": "2026-05-01",
+        }]
+
+        def fresh(jobs):
+            return [{
+                "jr": j["jr"], "id": j["id"], "title": j["name"], "link": j["link"],
+                "score": 91, "suitability": "Strong fit", "recommendation": "Apply",
+                "matchedReasons": [], "gapReasons": [], "verdict": "new",
+            } for j in jobs]
+
+        report = daily.build_report(
+            current_jobs=day2, previous_jobs=day1, previous_snapshot_file="/tmp/2026-05-01.json",
+            snapshot_history=[{"label": "2026-05-01", "jobs": day1}, {"label": "2026-05-02", "jobs": day2}],
+            successful_score_keys=set(),  # caller didn't dedup → JR1 enters as a candidate
+            ledger_jobs=ledger_jobs,
+            report_date="2026-05-02",  # match the history's "today" so JR1 surfaces in the digest
+            score_fn=fresh,
+        )
+        self.assertEqual(report["rankedJobCount"], 1)
+        self.assertEqual(report["rankedJobs"][0]["score"], 91)
+        self.assertEqual(report["rankedJobs"][0]["verdict"], "new")
 
     def test_build_report_skips_intern(self):
         previous = [{"id": 1, "jr": "JR1", "name": "Old"}]
@@ -592,6 +661,25 @@ class DailyTests(unittest.TestCase):
             daily.ensure_dir = original_ensure_dir
             daily.remove_latest_report_files = original_remove_latest_report_files
             daily.write_grouped = original_write_grouped
+
+    def test_persist_daily_run_requires_mysql(self):
+        # MySQL is the ledger; an unconfigured environment must fail loudly rather
+        # than silently skipping (the old behavior that let JSON-report dedup drift).
+        mysql_vars = (
+            "MYSQL_DSN", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_HOST",
+            "MYSQL_PORT", "MYSQL_SOCKET_PATH", "MYSQL_DATABASE",
+        )
+        saved = {var: os.environ.pop(var, None) for var in mysql_vars}
+        try:
+            with self.assertRaises(RuntimeError):
+                db.persist_daily_run_from_env(
+                    location="Shanghai, China", run_date="2026-05-26",
+                    current_jobs=[], report={},
+                )
+        finally:
+            for var, value in saved.items():
+                if value is not None:
+                    os.environ[var] = value
 
     def test_render_markdown_canceled_section(self):
         md = daily.render_markdown(
