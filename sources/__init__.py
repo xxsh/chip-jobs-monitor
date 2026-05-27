@@ -8,12 +8,17 @@ fetch.py (Playwright); these adapters are plain HTTP against public careers APIs
 Registry value: {"display": <label>, "fetch": <callable(max_jobs=None)>}.
 """
 
+from .amazon import fetch_amazon
 from .amd import fetch_amd
 from .arm import fetch_arm
 from .workday import make_workday_fetcher
 
 # Location target is Shanghai across all sources (matches the NVIDIA monitor).
 SOURCES = {
+    "amazon": {
+        "display": "Amazon",
+        "fetch": lambda max_jobs=None: fetch_amazon(city="Shanghai", max_jobs=max_jobs),
+    },
     "amd": {
         "display": "AMD",
         "fetch": lambda max_jobs=None: fetch_amd(city="Shanghai", max_jobs=max_jobs),
