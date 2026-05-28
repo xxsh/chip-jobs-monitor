@@ -51,7 +51,7 @@ def bounded_int(value, fallback, lo, hi):
 SCORER_CONCURRENCY = max(1, min(3, bounded_int(os.environ.get("NVIDIA_SCORER_CONCURRENCY"), 3, 1, 3)))
 SCORER_JOB_TIMEOUT_SECONDS = bounded_int(os.environ.get("NVIDIA_SCORER_JOB_TIMEOUT_SECONDS"), 90, 15, 600)
 SCORER_ATTEMPTS = bounded_int(os.environ.get("NVIDIA_SCORER_ATTEMPTS"), 1, 1, 3)
-MAX_SCORING_JOBS_PER_RUN = bounded_int(os.environ.get("NVIDIA_MAX_SCORING_JOBS_PER_RUN"), 3, 0, 100)
+MAX_SCORING_JOBS_PER_RUN = bounded_int(os.environ.get("NVIDIA_MAX_SCORING_JOBS_PER_RUN"), 10, 0, 100)
 
 
 def resolve_scorer_codex_home():
