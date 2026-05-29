@@ -404,6 +404,26 @@ def diff_with_previous(current):
 
 # --- Playwright-backed scraping (browser imported lazily) ---
 
+# jobs.nvidia.com is an Eightfold SPA that pulls ~MB of app JS before the page
+# fires domcontentloaded. Over a throttled link that overran the 60s nav timeout
+# and broke the NVIDIA fetch outright (observed 2026-05-29). We never need the
+# rendered SPA — only the document itself (it sets the session cookie, and detail
+# pages carry the posting as inline ld+json) plus the in-page pcsx API call. So
+# abort the heavy subresources: navigation settles in seconds and the connection
+# stays free for the API fetch. Routing only blocks network requests, so an inline
+# <script type="application/ld+json"> on a detail page is unaffected.
+_BLOCK_RESOURCE_TYPES = {"script", "stylesheet", "image", "font", "media"}
+
+
+async def _block_heavy_assets(route):
+    try:
+        if route.request.resource_type in _BLOCK_RESOURCE_TYPES:
+            await route.abort()
+        else:
+            await route.continue_()
+    except Exception:  # noqa: BLE001 - routing races during teardown are non-fatal
+        pass
+
 
 async def create_context():
     from playwright.async_api import async_playwright
@@ -414,6 +434,7 @@ async def create_context():
         launch_kwargs["executable_path"] = CHROMIUM_PATH
     browser = await pw.chromium.launch(**launch_kwargs)
     ctx = await browser.new_context(user_agent=USER_AGENT)
+    await ctx.route("**/*", _block_heavy_assets)
     return pw, browser, ctx
 
 
