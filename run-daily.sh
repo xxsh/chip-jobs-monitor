@@ -36,4 +36,32 @@ if [[ -z "${NVIDIA_CHROMIUM_PATH:-}" ]]; then
 fi
 
 cd "$SCRIPT_DIR"
-exec env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY "$PYTHON_BIN" "$SCRIPT_DIR/daily.py"
+
+# Hard cap on the pipeline. A hung Playwright fetch or codex call must not pin
+# the whole run (and the cron job that exec's this) until the gateway's ~60min
+# global timeout. Override with DAILY_MAX_SECONDS.
+DAILY_MAX_SECONDS="${DAILY_MAX_SECONDS:-1200}"
+
+env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  "$PYTHON_BIN" "$SCRIPT_DIR/daily.py" &
+daily_pid=$!
+
+(
+  sleep "$DAILY_MAX_SECONDS"
+  if kill -0 "$daily_pid" 2>/dev/null; then
+    echo "run-daily: daily.py exceeded ${DAILY_MAX_SECONDS}s; terminating" >&2
+    kill -TERM "$daily_pid" 2>/dev/null
+    sleep 10
+    kill -KILL "$daily_pid" 2>/dev/null
+  fi
+) &
+watchdog_pid=$!
+
+rc=0
+wait "$daily_pid" || rc=$?
+
+# daily.py finished on its own — stop the idle watchdog.
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+
+exit "$rc"
