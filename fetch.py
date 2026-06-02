@@ -219,21 +219,32 @@ def is_boilerplate_line(line):
     return any(pattern.search(line) for pattern in _BOILERPLATE)
 
 
+# Section headers sometimes carry a leading markdown heading prefix on a posting
+# ("## What you'll be doing:"); the optional `#{1,6}` keeps that prefix from
+# defeating the match, which would otherwise collapse the whole JD into `summary`
+# and leave responsibilities/requirements/preferred empty (seen on JR2016323 and
+# ~325 other postings).
+_SECTION_HEADERS = (
+    (re.compile(r"^(?:#{1,6}\s*)?what you(?:'|’)ll be doing:?$", re.I), "responsibilities"),
+    (re.compile(r"^(?:#{1,6}\s*)?what we need to see:?$", re.I), "requirements"),
+    (re.compile(r"^(?:#{1,6}\s*)?ways to stand out from the crowd:?$", re.I), "preferred"),
+)
+# Lines that are only markdown punctuation ("#", "##", "---") are layout separators,
+# not content — drop them so they can't leak into a section list now that the headers
+# above also match ##-prefixed postings.
+_MARKDOWN_SEPARATOR = re.compile(r"^[#*\s-]+$")
+
+
 def parse_description_sections(description):
     lines = [ln.strip() for ln in clean_text(description).split("\n")]
-    lines = [ln for ln in lines if ln and ln != "##"]
+    lines = [ln for ln in lines if ln and not _MARKDOWN_SEPARATOR.match(ln)]
 
     sections = {"summary": [], "responsibilities": [], "requirements": [], "preferred": []}
     current = "summary"
     for line in lines:
-        if re.match(r"^what you(?:'|’)ll be doing:?$", line, re.I):
-            current = "responsibilities"
-            continue
-        if re.match(r"^what we need to see:?$", line, re.I):
-            current = "requirements"
-            continue
-        if re.match(r"^ways to stand out from the crowd:?$", line, re.I):
-            current = "preferred"
+        switched = next((sec for rx, sec in _SECTION_HEADERS if rx.match(line)), None)
+        if switched:
+            current = switched
             continue
         if is_boilerplate_line(line):
             continue

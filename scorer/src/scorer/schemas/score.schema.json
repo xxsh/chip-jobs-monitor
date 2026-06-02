@@ -3,19 +3,64 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "roleArchetype",
+    "coverageMatrix",
+    "criticalGaps",
     "score",
     "suitability",
     "recommendation",
+    "confidence",
+    "scoreRationale",
     "matchedReasons",
     "gapReasons",
     "verdict"
   ],
   "properties": {
+    "roleArchetype": {
+      "type": "string",
+      "maxLength": 120,
+      "description": "Short phrase classifying what kind of role this actually is, judged from the whole posting (not just the title), e.g. 'production ML/platform infrastructure leadership' or 'GPU/SoC pre-silicon validation methodology'."
+    },
+    "coverageMatrix": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "description": "The role's core hard requirements (the must-haves the posting treats as required), each rated against the candidate's evidence. Build this BEFORE assigning the score.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requirement", "coverage", "evidence"],
+        "properties": {
+          "requirement": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "A core hard requirement from the posting (read from the full description even when the structured requirements list is sparse)."
+          },
+          "coverage": {
+            "type": "string",
+            "enum": ["direct", "adjacent", "missing"],
+            "description": "direct = specific demonstrated experience with that exact thing; adjacent = related/transferable but not the same; missing = no real evidence in the profile."
+          },
+          "evidence": {
+            "type": "string",
+            "maxLength": 280,
+            "description": "The concrete candidate evidence supporting this rating, or a note that it is absent."
+          }
+        }
+      }
+    },
+    "criticalGaps": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "items": {"type": "string", "maxLength": 280},
+      "description": "The missing or only-adjacent requirements that matter most for this role."
+    },
     "score": {
       "type": "integer",
       "minimum": 0,
       "maximum": 100,
-      "description": "Overall fit score 0-100. 0=clearly wrong role, 50=ambiguous, 100=ideal match."
+      "description": "Overall fit score 0-100, consistent with the coverageMatrix. 0=clearly wrong role, 50=ambiguous, 100=ideal match."
     },
     "suitability": {
       "type": "string",
@@ -26,6 +71,16 @@
       "type": "string",
       "enum": ["Apply", "Maybe", "Skip"],
       "description": "Action recommendation."
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"],
+      "description": "Confidence in this score: high only if the posting is detailed and the match is clear-cut; low if the posting is vague or the evidence is mixed."
+    },
+    "scoreRationale": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "One or two sentences tying the score to the coverage matrix (e.g. '3 of 6 core requirements are missing, so capped at Good fit')."
     },
     "matchedReasons": {
       "type": "array",
