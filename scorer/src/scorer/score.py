@@ -28,21 +28,43 @@ PROMPT_TEMPLATE = """\
 You are scoring a single job posting against a candidate profile to
 decide whether the candidate should apply.
 
-Be honest and concrete. Use the candidate's actual background — match
-strengths, point out real gaps. Avoid generic praise. Do not invent
-skills the candidate does not have.
+Reason from the evidence to the score, in this order — do not start from a number:
 
-Scoring guidance (0-100):
-- 80-100 Strong fit: candidate's primary domains map directly to the role's core requirements; minimal gaps.
-- 60-79  Good fit: most requirements match; some gaps but learnable.
+1. roleArchetype: classify what kind of role this actually is, in one short phrase
+   (e.g. "production ML/platform infrastructure leadership", "GPU/SoC pre-silicon
+   validation methodology", "CUDA kernel performance"). Judge from the whole
+   posting, not just the title.
+2. coverageMatrix: extract the role's core hard requirements — the 5-8 must-haves the
+   posting treats as required (years and depth of experience, specific technologies,
+   domain). Read them from the full `description` even when the structured
+   `requirements:` list is sparse or says "(see description)". Rate the candidate's
+   evidence for each:
+     - "direct"   — specific, demonstrated experience with that exact thing
+     - "adjacent" — related/transferable experience, but not the same thing
+     - "missing"  — no real evidence in the profile
+   Cite the concrete requirement and the candidate evidence (or its absence).
+3. criticalGaps: the missing or only-adjacent requirements that matter most.
+4. Only now assign `score`, consistent with the coverage you just built.
+
+Scoring bands (0-100):
+- 80-100 Strong fit: candidate has DIRECT evidence for the role's core hard requirements; gaps are minor/learnable.
+- 60-79  Good fit: most requirements covered (direct or adjacent); some real gaps.
 - 40-59  Possible stretch: partial overlap; meaningful gaps in core areas.
-- 0-39   Low fit: role's core requirements fall outside candidate's experience.
+- 0-39   Low fit: the role's core requirements fall outside the candidate's experience.
 
-Match `suitability` to the score band. `recommendation`: "Apply" for Strong fit, "Maybe" for Good fit or Possible stretch, "Skip" for Low fit.
+Hard rules (apply after building coverageMatrix):
+- Strong fit (>=80) requires DIRECT evidence for the role's core work, not just adjacent domain overlap.
+- If two or more core hard requirements are missing, the score must be below 80.
+- `suitability` must match the score band. `recommendation`: "Apply" for Strong fit, "Maybe" for Good fit or Possible stretch, "Skip" for Low fit.
 
-For `matchedReasons` and `gapReasons`, cite specific things from the resume profile and the job posting (e.g., "candidate's ATE production test experience matches the silicon characterization scope" rather than "good technical match"). Each reason should be a single sentence.
+Be honest and concrete. Use the candidate's actual background — match real
+strengths, name real gaps. Avoid generic praise. Do not invent skills the
+candidate does not have.
 
-`verdict` is one paragraph (2-3 sentences) the candidate reads at a glance.
+- scoreRationale: one or two sentences tying the score to the coverage matrix.
+- confidence: "high" only if the posting is detailed and the match is clear-cut; "low" if the posting is vague or the evidence is mixed.
+- For `matchedReasons` and `gapReasons`, cite specific things from the resume profile and the job posting (e.g., "candidate's ATE production test experience matches the silicon characterization scope" rather than "good technical match"). Each reason should be a single sentence.
+- `verdict` is one paragraph (2-3 sentences) the candidate reads at a glance.
 
 <candidate_profile>
 {profile}
@@ -74,8 +96,12 @@ preferred:
 
 
 def _format_list(items: list[str] | None) -> str:
+    # When a structured section is empty, point the model at the description rather
+    # than asserting "(none listed)": the requirements are frequently present in the
+    # description prose even when the fetch parser didn't split them into a list, and
+    # a false "none" signal makes the scorer under-weight real hard requirements.
     if not items:
-        return "(none listed)"
+        return "(see description)"
     return "\n".join(f"- {x}" for x in items)
 
 
@@ -97,13 +123,40 @@ def _job_payload(job: dict[str, Any], profile: dict[str, Any]) -> str:
     )
 
 
+# Deterministic backstop for the prompt's hard cap rule. The prompt already tells the
+# model "two or more core hard requirements missing -> score below 80", but a prompt
+# rule is advisory. This enforces it from the model's OWN coverageMatrix so a Strong
+# fit can't survive >=2 missing core requirements no matter what the model returns.
+# It reads only the model's coverage labels (no hardcoded archetypes), so it can't
+# over-fit to a role. The "direct evidence for core work" rule stays a model judgment
+# (not machine-checkable); only the mechanical missing-count rule is enforced here.
+_MAX_MISSING_FOR_STRONG = 2
+_CAPPED_SCORE = 79  # top of the Good fit band (60-79)
+
+
+def _enforce_score_caps(result: dict[str, Any]) -> dict[str, Any]:
+    coverage = result.get("coverageMatrix") or []
+    missing = sum(
+        1 for entry in coverage if isinstance(entry, dict) and entry.get("coverage") == "missing"
+    )
+    score = result.get("score")
+    if missing >= _MAX_MISSING_FOR_STRONG and isinstance(score, int) and score >= 80:
+        result = dict(result)  # copy: never mutate the caller's dict
+        result["uncappedScore"] = score
+        result["scoreCapApplied"] = True
+        result["score"] = _CAPPED_SCORE
+        result["suitability"] = "Good fit"
+        result["recommendation"] = "Maybe"
+    return result
+
+
 def score_job(job: dict[str, Any], profile: dict[str, Any], *, timeout: int = 120, attempts: int = 1) -> dict[str, Any]:
     """Score one job. On LLM failure returns a result with `error` set."""
     prompt = _job_payload(job, profile)
     last_err: str | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            return call_codex(prompt, SCHEMA_PATH, timeout=timeout)
+            return _enforce_score_caps(call_codex(prompt, SCHEMA_PATH, timeout=timeout))
         except LLMError as exc:
             last_err = str(exc)
             if attempt < attempts:
