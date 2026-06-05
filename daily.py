@@ -132,9 +132,52 @@ def acquire_run_lock():
             except (OSError, ValueError):
                 pid = None
             if pid is not None and process_is_alive(pid):
-                raise RuntimeError(f"NVIDIA daily monitor is already running with pid {pid}")
+                # The holder is alive. Normally we back off — but a scheduled run
+                # can be abandoned by the gateway while daily.py keeps running
+                # detached, and a wedged run can outlive run-daily.sh's watchdog.
+                # If the lock is older than the stale threshold, presume the
+                # holder is stuck, terminate it, and take over instead of
+                # FATAL-ing this run.
+                age = lock_age_seconds()
+                stale_after = float(os.environ.get("DAILY_LOCK_STALE_SECONDS", "1500"))
+                if age is None or age < stale_after:
+                    raise RuntimeError(
+                        f"NVIDIA daily monitor is already running with pid {pid}"
+                        + (f" (lock age {int(age)}s)" if age is not None else "")
+                    )
+                import signal
+                import time
+
+                print(
+                    f"daily: reclaiming stale lock from pid {pid} "
+                    f"(age {int(age)}s >= {int(stale_after)}s); terminating it",
+                    file=sys.stderr,
+                )
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.kill(pid, sig)
+                    except OSError:
+                        break
+                    for _ in range(10):
+                        if not process_is_alive(pid):
+                            break
+                        time.sleep(1)
+                    if not process_is_alive(pid):
+                        break
             _rmtree(LOCK_DIR)
     raise RuntimeError(f"Could not acquire NVIDIA daily monitor lock at {LOCK_DIR}")
+
+
+def lock_age_seconds():
+    """Seconds since the current lock was acquired, or None if unknown."""
+    try:
+        with open(os.path.join(LOCK_DIR, "started_at")) as f:
+            started = datetime.fromisoformat(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - started).total_seconds()
 
 
 def _rmtree(path):
@@ -789,10 +832,44 @@ def strip_proxy_env():
 def run_fetch():
     strip_proxy_env()
     import asyncio
+    import time
 
     import fetch  # noqa: E402 - lazy: pulls in Playwright only when fetching
 
-    asyncio.run(fetch.main())
+    # The NVIDIA scrape drives a real Chromium. In a background/scheduled run macOS
+    # can suspend the process's network I/O (App Nap / idle sleep), surfacing as
+    # net::ERR_NETWORK_IO_SUSPENDED (and friends) mid-navigation — which is why
+    # manual foreground runs succeed but the cron run fails. These are transient,
+    # so retry the whole fetch with a fresh browser each attempt. run-daily.sh also
+    # holds a `caffeinate` assertion for the run's lifetime to prevent the sleep
+    # that triggers this in the first place.
+    transient_markers = (
+        "ERR_NETWORK_IO_SUSPENDED",
+        "ERR_NETWORK_CHANGED",
+        "ERR_INTERNET_DISCONNECTED",
+        "ERR_CONNECTION",
+        "ERR_TIMED_OUT",
+        "ERR_NAME_NOT_RESOLVED",
+        "Timeout",
+        "net::ERR",
+    )
+    attempts = max(1, int(os.environ.get("NVIDIA_FETCH_ATTEMPTS", "3")))
+    for attempt in range(1, attempts + 1):
+        try:
+            asyncio.run(fetch.main())
+            return
+        except Exception as error:  # noqa: BLE001 - classify, then re-raise or retry
+            message = str(error)
+            is_transient = any(marker in message for marker in transient_markers)
+            if not is_transient or attempt == attempts:
+                raise
+            backoff = min(30, 5 * attempt)
+            print(
+                f"NVIDIA fetch attempt {attempt}/{attempts} hit transient network "
+                f"error; retrying in {backoff}s: {message[:160]}",
+                file=sys.stderr,
+            )
+            time.sleep(backoff)
 
 
 def _registry():

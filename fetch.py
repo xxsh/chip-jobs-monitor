@@ -440,7 +440,17 @@ async def create_context():
     from playwright.async_api import async_playwright
 
     pw = await async_playwright().start()
-    launch_kwargs = {"headless": True}
+    # Keep Chromium from throttling/suspending its renderer + timers when it's not
+    # the foreground app — in a headless background/cron run that throttling is part
+    # of what surfaces as net::ERR_NETWORK_IO_SUSPENDED mid-navigation.
+    launch_kwargs = {
+        "headless": True,
+        "args": [
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+        ],
+    }
     if CHROMIUM_PATH:
         launch_kwargs["executable_path"] = CHROMIUM_PATH
     browser = await pw.chromium.launch(**launch_kwargs)
