@@ -46,6 +46,17 @@ env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u AL
   "$PYTHON_BIN" "$SCRIPT_DIR/daily.py" &
 daily_pid=$!
 
+# Keep macOS awake for the life of daily.py. A background/scheduled run otherwise
+# gets idle/App-Nap-suspended mid-scrape, which Chromium reports as
+# net::ERR_NETWORK_IO_SUSPENDED and breaks the NVIDIA fetch. `-w` watches daily.py
+# and exits on its own when it does, so daily_pid stays the python process and the
+# watchdog below can still terminate it directly. caffeinate is best-effort.
+caffeine_pid=""
+if command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -m -s -w "$daily_pid" &
+  caffeine_pid=$!
+fi
+
 (
   sleep "$DAILY_MAX_SECONDS"
   if kill -0 "$daily_pid" 2>/dev/null; then
@@ -63,5 +74,11 @@ wait "$daily_pid" || rc=$?
 # daily.py finished on its own — stop the idle watchdog.
 kill "$watchdog_pid" 2>/dev/null || true
 wait "$watchdog_pid" 2>/dev/null || true
+
+# caffeinate -w exits on its own when daily.py does; clean up just in case.
+if [[ -n "$caffeine_pid" ]]; then
+  kill "$caffeine_pid" 2>/dev/null || true
+  wait "$caffeine_pid" 2>/dev/null || true
+fi
 
 exit "$rc"
