@@ -1,10 +1,14 @@
 """Shared helpers for HTTP job-source adapters: direct JSON fetch, HTML→text,
 and the normalized job schema (identical shape to fetch.py's enriched jobs)."""
 
+import http.client
 import json
 import os
 import re
+import socket
 import ssl
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from html import unescape
@@ -45,10 +49,52 @@ _DIRECT_OPENER = urllib.request.build_opener(
 )
 
 
+# Transient connection-level failures worth retrying. These careers endpoints
+# (notably Amazon and AMD) intermittently reset the connection or abort the TLS
+# handshake — "Remote end closed connection without response" (RemoteDisconnected)
+# and "SSL: UNEXPECTED_EOF_WHILE_READING" — which succeed on a second attempt.
+_RETRY_EXCEPTIONS = (
+    urllib.error.URLError,  # wraps connection-refused/reset/DNS; ssl.SSLError surfaces here too
+    ssl.SSLError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    ConnectionError,  # ConnectionResetError / ConnectionAbortedError
+    socket.timeout,
+    TimeoutError,
+)
+
+
+def _read_with_retry(req, timeout, attempts=4, base_delay=2.0):
+    """Open `req` through the direct opener, retrying transient network failures.
+
+    HTTP error responses (4xx/5xx) are not retried unless the server signals an
+    explicitly transient status (429/502/503/504) — those usually mean the request
+    itself is wrong, so retrying just hammers the endpoint.
+    """
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
+                return resp.read(), resp.headers
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 502, 503, 504) and i < attempts:
+                last_err = e
+                time.sleep(base_delay * i)
+                continue
+            raise
+        except _RETRY_EXCEPTIONS as e:
+            last_err = e
+            if i < attempts:
+                time.sleep(base_delay * i)
+                continue
+            raise
+    raise last_err  # pragma: no cover
+
+
 def http_get_json(url, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    body, _ = _read_with_retry(req, timeout)
+    return json.loads(body.decode("utf-8"))
 
 
 def http_get_text(url, timeout=30):
@@ -56,9 +102,9 @@ def http_get_text(url, timeout=30):
         url,
         headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
     )
-    with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.read().decode(charset, errors="replace")
+    body, headers = _read_with_retry(req, timeout)
+    charset = headers.get_content_charset() or "utf-8"
+    return body.decode(charset, errors="replace")
 
 
 def http_post_json(url, body, timeout=30):
@@ -68,8 +114,8 @@ def http_post_json(url, body, timeout=30):
         data=data,
         headers={"User-Agent": USER_AGENT, "Accept": "application/json", "Content-Type": "application/json"},
     )
-    with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    resp_body, _ = _read_with_retry(req, timeout)
+    return json.loads(resp_body.decode("utf-8"))
 
 
 class _TextExtractor(HTMLParser):
