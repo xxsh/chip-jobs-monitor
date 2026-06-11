@@ -11,7 +11,7 @@
     "fetch:py": ".venv/bin/python fetch.py",
     "fetch:verify": "python3 verify_fetch_render.py",
     "db:verify": "python3 verify_db.py",
-    "rescore:import": "node scripts/import-rescore-report.mjs",
+    "rescore:import": "python3 scripts/import-rescore-report.py",
     "daily:py": ".venv/bin/python daily.py",
     "daily:test": "python3 -m unittest daily_test test_arm_source",
     "test": "node --test"

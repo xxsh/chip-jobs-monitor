@@ -266,65 +266,86 @@ async function queryTrends() {
         JOIN latest_run lr ON lr.source = j.source AND lr.location_slug = r.location_slug
         WHERE j.last_seen_date >= lr.latest_run_date
       ),
-      prev_resume AS (
-        -- The job's score under the *previous* resume: the most recent score
-        -- under any profile_hash other than the current one, drawn from BOTH
-        -- the profile-keyed overlay and the run-keyed history (older daily
-        -- scores predate the overlay), preferring the overlay. Used for the
-        -- old→new delta.
-        SELECT job_id, score, suitability
-        FROM (
-          SELECT
-            job_id, score, suitability,
-            ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY src_rank, updated_at DESC, id DESC) AS rn
-          FROM (
-            SELECT job_id, score, suitability, updated_at, id, 0 AS src_rank
-            FROM resume_scores WHERE profile_hash <> ?
-            UNION ALL
-            SELECT job_id, score, suitability, updated_at, id, 1 AS src_rank
-            FROM scores WHERE score IS NOT NULL AND (profile_hash IS NULL OR profile_hash <> ?)
-          ) prev_union
-        ) ranked_prev
+      score_events AS (
+        SELECT
+          rs.id AS event_id,
+          rs.job_id,
+          rs.score,
+          rs.suitability,
+          rs.recommendation,
+          rs.first_seen_date,
+          rs.profile_hash,
+          rs.report_file,
+          rs.updated_at AS score_updated_at,
+          'resume_scores' AS score_source,
+          0 AS source_rank
+        FROM resume_scores rs
+        WHERE rs.score IS NOT NULL
+        UNION ALL
+        SELECT
+          s.id AS event_id,
+          s.job_id,
+          s.score,
+          s.suitability,
+          s.recommendation,
+          s.first_seen_date,
+          s.profile_hash,
+          NULL AS report_file,
+          s.updated_at AS score_updated_at,
+          'scores' AS score_source,
+          1 AS source_rank
+        FROM scores s
+        WHERE s.score IS NOT NULL
+      ),
+      ranked_score_events AS (
+        SELECT
+          se.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY se.job_id
+            ORDER BY se.score_updated_at DESC, se.source_rank, se.event_id DESC
+          ) AS rn
+        FROM score_events se
+        JOIN active_jobs aj ON aj.id = se.job_id
+      ),
+      latest_scores AS (
+        SELECT *
+        FROM ranked_score_events
         WHERE rn = 1
       ),
-      hist_scores AS (
-        -- Pure fallback: latest run-keyed score for jobs that have no
-        -- resume_scores row yet (legacy data, or mid-convergence).
+      previous_scores AS (
         SELECT *
-        FROM (
-          SELECT
-            s.*,
-            ROW_NUMBER() OVER (PARTITION BY s.job_id ORDER BY s.score DESC, s.updated_at DESC, s.id DESC) AS rn
-          FROM scores s
-          WHERE s.score IS NOT NULL
-        ) ranked_scores
-        WHERE rn = 1
+        FROM ranked_score_events
+        WHERE rn = 2
       ),
       display_scores AS (
         SELECT
           aj.id AS job_id,
           aj.source,
-          DATE_FORMAT(COALESCE(rs.first_seen_date, aj.first_seen_date), '%Y-%m-%d') AS date,
+          DATE_FORMAT(COALESCE(ls.first_seen_date, aj.first_seen_date), '%Y-%m-%d') AS date,
           aj.jr,
           aj.title,
           aj.link,
           aj.department,
-          COALESCE(rs.score, hist.score) AS score,
-          COALESCE(rs.suitability, hist.suitability) AS suitability,
-          COALESCE(rs.recommendation, hist.recommendation) AS recommendation,
-          pr.score AS previousScore,
-          pr.suitability AS previousSuitability,
-          rs.score AS resumeScore,
-          IF(rs.id IS NULL, 0, 1) AS resumeScored,
+          ls.score,
+          ls.suitability,
+          ls.recommendation,
+          ps.score AS previousScore,
+          ps.suitability AS previousSuitability,
+          IF(ls.score_source = 'resume_scores', ls.score, NULL) AS resumeScore,
+          IF(ls.score_source = 'resume_scores', 1, 0) AS resumeScored,
           CASE
-            WHEN rs.score IS NULL OR pr.score IS NULL THEN NULL
-            ELSE CAST(rs.score AS SIGNED) - CAST(pr.score AS SIGNED)
+            WHEN ls.score IS NULL OR ps.score IS NULL THEN NULL
+            ELSE CAST(ls.score AS SIGNED) - CAST(ps.score AS SIGNED)
           END AS scoreDelta,
+          ls.score_source AS scoreSource,
+          ls.profile_hash AS scoreProfileHash,
+          DATE_FORMAT(ls.score_updated_at, '%Y-%m-%d %H:%i:%s') AS scoreUpdatedAt,
+          DATE_FORMAT(ls.score_updated_at, '%Y-%m-%d') AS scoreDate,
+          ls.report_file AS scoreReportFile,
           'valid' AS status
         FROM active_jobs aj
-        LEFT JOIN resume_scores rs ON rs.job_id = aj.id AND rs.profile_hash = ?
-        LEFT JOIN prev_resume pr ON pr.job_id = aj.id
-        LEFT JOIN hist_scores hist ON hist.job_id = aj.id
+        LEFT JOIN latest_scores ls ON ls.job_id = aj.id
+        LEFT JOIN previous_scores ps ON ps.job_id = aj.id
       )
     `;
 
@@ -337,7 +358,6 @@ async function queryTrends() {
         GROUP BY source, date, suitability
         ORDER BY date, source
       `,
-      [profileHash, profileHash, profileHash],
     );
 
     const [scoreStats] = await connection.execute(
@@ -348,7 +368,6 @@ async function queryTrends() {
         WHERE score IS NOT NULL
         GROUP BY source
       `,
-      [profileHash, profileHash, profileHash],
     );
 
     const [roles] = await connection.execute(
@@ -369,19 +388,25 @@ async function queryTrends() {
           previousSuitability,
           resumeScore,
           resumeScored,
-          scoreDelta
+          scoreDelta,
+          scoreSource,
+          scoreProfileHash,
+          scoreUpdatedAt,
+          scoreDate,
+          scoreReportFile
         FROM display_scores
         WHERE score IS NOT NULL
-        ORDER BY score DESC, date DESC, title
+        ORDER BY score DESC, scoreUpdatedAt DESC, title
         LIMIT 500
       `,
-      [profileHash, profileHash, profileHash],
     );
 
-    const [resumeScoreRows] = await connection.execute(
-      'SELECT COUNT(*) AS count FROM resume_scores WHERE profile_hash = ?',
-      [profileHash],
-    );
+    const [scoreEventRows] = await connection.execute(`
+      SELECT
+        (SELECT COUNT(*) FROM scores WHERE score IS NOT NULL)
+        + (SELECT COUNT(*) FROM resume_scores WHERE score IS NOT NULL) AS count
+    `);
+    const latestScoreCount = scoreStats.reduce((sum, row) => sum + numberValue(row.scoredRows), 0);
 
     const [recentAdds] = await connection.execute(`
       SELECT source, DATE_FORMAT(first_seen_date, '%Y-%m-%d') AS date, jr, title, link, department
@@ -433,8 +458,9 @@ async function queryTrends() {
         totalScored,
         queued: latestQueued,
         bestScore,
-        scoreMode: 'latest-resume',
-        resumeScoreCount: numberValue(resumeScoreRows[0]?.count),
+        scoreMode: 'latest-score-event',
+        latestScoreCount,
+        scoreEventCount: numberValue(scoreEventRows[0]?.count),
         profileHash: currentProfile.resumeHash,
       },
       sources,

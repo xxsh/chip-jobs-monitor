@@ -45,7 +45,7 @@
         <article class="panel panel-roles">
           <div class="panel-head">
             <h2>Top scored roles</h2>
-            <span>vs current resume</span>
+            <span>latest score event</span>
           </div>
           <ol class="role-list" id="topRoles"></ol>
         </article>
@@ -67,7 +67,7 @@
 
       <section class="panel panel-roles-full" aria-label="Scored roles">
         <div class="panel-head roles-head">
-          <h2>Scored roles vs current resume</h2>
+          <h2>Scored roles by latest score</h2>
           <div class="roles-controls">
             <select id="roleCompany" aria-label="Filter by company">
               <option value="">All companies</option>
@@ -81,7 +81,7 @@
             </select>
             <select id="roleSort" aria-label="Sort roles">
               <option value="score">Sort: score</option>
-              <option value="delta">Sort: Δ resume</option>
+              <option value="delta">Sort: score Δ</option>
               <option value="date">Sort: date</option>
             </select>
             <input id="roleSearch" type="search" placeholder="search title / JR / dept…" aria-label="Search roles">
@@ -97,7 +97,7 @@
                 <th>Fit</th>
                 <th>Role</th>
                 <th>Rec</th>
-                <th class="num">Δ resume</th>
+                <th class="num">Δ score</th>
                 <th>JR</th>
                 <th>First seen</th>
               </tr>
