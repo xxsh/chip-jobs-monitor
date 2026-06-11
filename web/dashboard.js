@@ -68,16 +68,14 @@ function pointsToPath(points) {
 }
 
 function renderMetrics(summary) {
-  const profileNote = summary.profileHash
-    ? `profile ${String(summary.profileHash).slice(0, 8)}`
-    : 'profile unavailable';
+  const scoreMode = summary.scoreMode === 'latest-score-event' ? 'latest score event' : 'latest resume';
   const cards = [
     ['Active roles', fmt(summary.activeJobs), `${fmtSigned(summary.activeDelta)} vs previous source runs`],
     ['Companies', fmt(summary.sourceCount), `${summary.location || 'All locations'} · latest ${summary.latestDate || 'no runs'}`],
     ['Latest added', fmt(summary.latestAdded), `${fmt(summary.totalAdded)} added across history`],
     ['Latest canceled', fmt(summary.latestCanceled), `${fmt(summary.totalCanceled)} canceled across history`],
-    ['Profile scores', fmt(summary.resumeScoreCount), `${fmt(summary.totalScored)} historical scores retained`],
-    ['Best score', summary.bestScore ?? 'N/A', `latest resume · ${profileNote}`],
+    ['Latest scores', fmt(summary.latestScoreCount ?? 0), `${fmt(summary.scoreEventCount ?? 0)} score events retained`],
+    ['Best score', summary.bestScore ?? 'N/A', scoreMode],
   ];
   metricsEl.innerHTML = cards.map(([label, value, note]) => `
     <article class="metric">
@@ -283,19 +281,25 @@ function recClass(rec) {
 }
 
 function deltaCell(role) {
-  if (!Number(role.resumeScored) || role.previousScore == null || role.scoreDelta == null) {
+  if (role.previousScore == null || role.scoreDelta == null) {
     return '<span class="delta-none">—</span>';
   }
   const d = Number(role.scoreDelta);
   const cls = d > 0 ? 'delta-up' : d < 0 ? 'delta-down' : 'delta-flat';
   const arrow = d > 0 ? '▲' : d < 0 ? '▼' : '·';
-  return `<span class="delta ${cls}" title="was ${escapeHtml(role.previousScore)} under the previous resume">${arrow} ${d >= 0 ? '+' : ''}${d}</span>`;
+  return `<span class="delta ${cls}" title="previous score event was ${escapeHtml(role.previousScore)}">${arrow} ${d >= 0 ? '+' : ''}${d}</span>`;
 }
 
 function scoreDeltaPill(role) {
-  if (!Number(role.resumeScored) || role.previousScore == null || role.scoreDelta == null) return '';
+  if (role.previousScore == null || role.scoreDelta == null) return '';
   const delta = Number(role.scoreDelta);
-  return `<span class="score-delta">old ${escapeHtml(role.previousScore)} · ${delta >= 0 ? '+' : ''}${escapeHtml(delta)}</span>`;
+  return `<span class="score-delta">prev ${escapeHtml(role.previousScore)} · ${delta >= 0 ? '+' : ''}${escapeHtml(delta)}</span>`;
+}
+
+function scoreSourcePill(role) {
+  if (role.scoreSource === 'resume_scores') return '<span class="profile-pill">manual rescore</span>';
+  if (role.scoreSource === 'scores') return '<span class="profile-pill">daily score</span>';
+  return '';
 }
 
 function renderTopRoles(roles) {
@@ -306,7 +310,7 @@ function renderTopRoles(roles) {
         ${sourcePill(role)}
         ${statusPill(role)}
         <span class="pill ${suitabilityClass(role.suitability)}">${escapeHtml(role.score)} · ${escapeHtml(role.suitability)}</span>
-        ${Number(role.resumeScored) ? '<span class="profile-pill">latest resume</span>' : ''}
+        ${scoreSourcePill(role)}
         ${scoreDeltaPill(role)}
         <span>${escapeHtml(role.jr)}</span>
         <span>${escapeHtml(role.date)}</span>
