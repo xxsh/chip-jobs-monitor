@@ -27,6 +27,14 @@ and concrete — pull actual technologies, domains, and seniority signals
 from the resume, not generic phrases. The profile must be honest about
 both strengths and likely poor-fit areas.
 
+Every array item must be a single atomic value — one skill, one domain, one
+degree per string. Never concatenate several into one entry; split on commas.
+
+For `education`, list each formal degree as its own entry with degree level,
+field/major, institution, and years. Many postings gate on a specific degree
+(e.g. "MS in CS/EE or a related field"), so capture the level and field
+faithfully — do not omit or upgrade them.
+
 For `antiPreferences`, infer roles the candidate would NOT be a strong
 match for based on what is missing from the resume (e.g., if there is no
 RTL/Verilog experience, "RTL or physical ASIC design" is an
@@ -60,6 +68,7 @@ _HASH_LIST_FIELDS = (
     "secondarySkills",
     "preferences",
     "antiPreferences",
+    "education",
 )
 
 
