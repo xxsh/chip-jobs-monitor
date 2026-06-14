@@ -98,6 +98,65 @@ def profile_hash(profile: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+# The codex backend intermittently leaks its chain-of-thought into a string
+# field — a giant run-on coreSkills entry, or text like "...Wait, schema expects
+# a string...". Such output still satisfies the JSON schema, so schema validation
+# alone can't catch it, yet it silently corrupts every downstream score. Detect
+# it heuristically and re-extract; a clean draft almost always appears within a
+# few attempts.
+_EXTRACTION_ATTEMPTS = 6
+_MAX_ITEM_CHARS = 90  # list items are atomic skills/domains/degrees, never prose
+_LEAK_MARKERS = (
+    "schema expect",
+    "valid json",
+    "i accidentally",
+    "wait final",
+    "response_format",
+    "output_schema",
+    "need continue",
+    "let's draft",
+)
+_CLEAN_CHECK_FIELDS = _HASH_LIST_FIELDS  # the array fields the model can garble
+
+
+def _profile_defect(profile: dict) -> str | None:
+    """Return a reason if the profile looks like leaked/garbled codex output,
+    else None — catches chain-of-thought bleeding into a schema-valid field."""
+    for field in _CLEAN_CHECK_FIELDS:
+        for item in profile.get(field) or []:
+            if len(str(item)) > _MAX_ITEM_CHARS:
+                return f"run-on item in {field}: {str(item)[:60]!r}"
+    headline = profile.get("headline")
+    if not isinstance(headline, str) or headline.strip() in ("", "..."):
+        return "missing headline"
+    blob = json.dumps(profile, ensure_ascii=False).lower()
+    for marker in _LEAK_MARKERS:
+        if marker in blob:
+            return f"reasoning-leak marker {marker!r}"
+    return None
+
+
+def _extract_clean(prompt: str) -> dict:
+    """Call codex, retrying until the output is free of leaked reasoning.
+
+    Raises LLMError if every attempt is malformed — failing loudly beats caching
+    a garbled profile that silently skews scoring."""
+    last_defect = "no attempts"
+    for _ in range(_EXTRACTION_ATTEMPTS):
+        try:
+            profile = call_codex(prompt, SCHEMA_PATH, timeout=600)
+        except LLMError as exc:
+            last_defect = str(exc)
+            continue
+        defect = _profile_defect(profile)
+        if defect is None:
+            return profile
+        last_defect = defect
+    raise LLMError(
+        f"profile extraction returned malformed output {_EXTRACTION_ATTEMPTS}x (last: {last_defect})"
+    )
+
+
 def extract_profile(resume_path: Path, *, force: bool = False) -> dict:
     resume_text = resume_path.read_text(encoding="utf-8")
     text_hash = _hash(resume_text)
@@ -107,7 +166,7 @@ def extract_profile(resume_path: Path, *, force: bool = False) -> dict:
         profile = json.loads(cache_file.read_text(encoding="utf-8"))
     else:
         prompt = PROMPT_TEMPLATE.format(resume=resume_text)
-        profile = call_codex(prompt, SCHEMA_PATH, timeout=600)
+        profile = _extract_clean(prompt)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
 
