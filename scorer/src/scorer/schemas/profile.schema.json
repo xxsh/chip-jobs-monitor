@@ -10,6 +10,7 @@
     "secondarySkills",
     "preferences",
     "antiPreferences",
+    "education",
     "headline"
   ],
   "properties": {
@@ -55,6 +56,12 @@
       "maxItems": 8,
       "items": {"type": "string"},
       "description": "Types of roles that would be a poor fit (e.g. RTL/circuit design, intern)."
+    },
+    "education": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {"type": "string"},
+      "description": "Each formal degree as its own string, most recent first: degree level, field/major, institution, and years — e.g. 'M.S. Materials Science, Harbin Institute of Technology (2014-2016)'. Many postings gate on a degree (e.g. 'MS in CS/EE or related field'), so capture level and field accurately. Empty array only if the resume genuinely lists no education."
     },
     "headline": {
       "type": "string",
