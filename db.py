@@ -725,7 +725,14 @@ def persist_daily_run(
             upsert_job_snapshot(conn, source=source, run_id=run_id, job_id=job_id, job=job)
         resume_path = _coalesce(report.get("resumePath"))
         resume_score_count = 0
-        for score in report.get("rankedJobs") or []:
+        # Persist every score produced this run, not just today's digest entries
+        # (rankedJobs). Backlog catch-ups must reach the profile-keyed resume_scores
+        # ledger or they're never "handled" and get re-scored every run — the backlog
+        # never drains. Fall back to rankedJobs for callers that predate scoredThisRun.
+        scored_jobs = report.get("scoredThisRun")
+        if scored_jobs is None:
+            scored_jobs = report.get("rankedJobs") or []
+        for score in scored_jobs:
             job_id = upsert_score(
                 conn,
                 source=source,
@@ -756,7 +763,7 @@ def persist_daily_run(
         return {
             "run_id": run_id,
             "job_snapshots": len(current_jobs or []),
-            "scores": len(report.get("rankedJobs") or []),
+            "scores": len(scored_jobs),
             "resume_scores": resume_score_count,
             "cancellations": len(report.get("canceledJobs") or []),
         }
