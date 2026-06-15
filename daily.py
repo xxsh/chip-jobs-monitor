@@ -712,6 +712,7 @@ def build_report(
             "rankedJobCount": 0,
             "rankedJobs": [],
             "newJobs": [],
+            "scoredThisRun": [],
         }
 
     diff = partition_diff(current_jobs, previous_jobs)
@@ -738,6 +739,14 @@ def build_report(
         before = len(model_score_candidates)
         model_score_candidates = [job for job in model_score_candidates if score_filter(job)]
         score_filtered_count = before - len(model_score_candidates)
+    # Score today's newly-added jobs before backlog re-scores. A profile (resume) edit
+    # changes profile_hash, which invalidates every prior score and re-queues the whole
+    # active catalog; with a per-run cap that backlog can otherwise starve same-day
+    # arrivals (they sit in deferred_jobs and never surface in the digest). Stable sort
+    # keeps existing order within each group, so this only reprioritizes across the
+    # cap boundary — backlog re-scores (firstSeenDate != today) don't show in the digest
+    # anyway, so deferring them costs nothing visible.
+    model_score_candidates.sort(key=lambda job: 0 if job.get("firstSeenDate") == report_date else 1)
     if max_scoring_jobs_per_run > 0:
         jobs_to_score = model_score_candidates[:max_scoring_jobs_per_run]
         deferred_jobs = model_score_candidates[max_scoring_jobs_per_run:]
@@ -760,6 +769,13 @@ def build_report(
         if j.get("firstSeenDate") == report_date and job_key(j) not in fresh_keys
     ]
     scored = sort_scored([*todays_fresh, *todays_ledger])
+    # Everything actually scored this run that should advance the authoritative
+    # (profile-keyed) resume_scores ledger — NOT just today's digest entries. Backlog
+    # catch-ups (firstSeenDate != today) are real scores under the current profile_hash;
+    # if they aren't persisted they never count as "handled" and get re-scored from
+    # scratch every run, so the backlog never drains. Includes today's ledger pre-fills
+    # (already persisted; upsert is idempotent). Persistence reads this, not rankedJobs.
+    scored_this_run = [*fresh_jobs, *todays_ledger]
     backlog_count = len([j for j in fresh_jobs if j.get("firstSeenDate") and j["firstSeenDate"] != report_date])
     score_error_count = len([j for j in fresh_jobs if j.get("error")])
     scored_dates = sorted({j["firstSeenDate"] for j in scored if j.get("firstSeenDate")})
@@ -792,6 +808,7 @@ def build_report(
         "rankedJobCount": len(scored),
         "rankedJobs": scored,
         "newJobs": scored,
+        "scoredThisRun": scored_this_run,
     }
 
 

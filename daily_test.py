@@ -168,7 +168,9 @@ class DailyTests(unittest.TestCase):
         )
         # L3 still scores the backlog (JR2 first seen yesterday, unscored until now)
         # so the ledger advances. But the L4 digest is today-only: only JR3 surfaces.
-        self.assertEqual([f"{j['jr']}:{j['firstSeenDate']}" for j in received["jobs"]], ["JR2:2026-05-02", "JR3:2026-05-03"])
+        # Today's JR3 is scored ahead of backlog JR2 (today-first ordering); under the
+        # default cap both still get scored, only the order differs.
+        self.assertEqual([f"{j['jr']}:{j['firstSeenDate']}" for j in received["jobs"]], ["JR3:2026-05-03", "JR2:2026-05-02"])
         self.assertEqual(report["addedCount"], 1)
         self.assertEqual(report["backlogCount"], 1)
         self.assertEqual(report["scoredDates"], ["2026-05-03"])
@@ -206,6 +208,41 @@ class DailyTests(unittest.TestCase):
         self.assertEqual(report["remainingUnscoredCount"], 2)
         self.assertEqual(report["deferredDates"], ["2026-05-02"])
         self.assertRegex(daily.render_telegram_digest(report), r"2 queued")
+
+    def test_build_report_today_scores_before_backlog(self):
+        # A profile change re-queues old jobs (empty successful_score_keys) alongside
+        # today's new arrival. With a scarce slot, today's job must win — otherwise a
+        # backlog re-score buries same-day arrivals and they never reach the digest.
+        old = {"id": 1, "jr": "JR_OLD", "name": "Backlog", "link": "https://x/1", "locations": ["China, Shanghai"]}
+        new = {"id": 2, "jr": "JR_NEW", "name": "Today", "link": "https://x/2", "locations": ["China, Shanghai"]}
+        day0 = []  # empty baseline so JR_OLD gets a real (earlier) firstSeenDate
+        day1 = [old]
+        day2 = [old, new]  # current_jobs order puts the backlog job first
+        received = {}
+
+        def fake(jobs):
+            received["jobs"] = jobs
+            return [
+                {
+                    "jr": j["jr"], "id": j["id"], "title": j["name"], "link": j.get("link"), "locations": j.get("locations"),
+                    "score": 70, "suitability": "Good fit", "recommendation": "Maybe",
+                    "matchedReasons": [], "gapReasons": [], "verdict": "Scored.",
+                }
+                for j in jobs
+            ]
+
+        report = daily.build_report(
+            current_jobs=day2, previous_jobs=day1, previous_snapshot_file="/tmp/2026-05-01.json",
+            snapshot_history=[
+                {"label": "2026-05-00", "jobs": day0},
+                {"label": "2026-05-01", "jobs": day1},
+                {"label": "2026-05-02", "jobs": day2},
+            ],
+            successful_score_keys=set(), report_date="2026-05-02", max_scoring_jobs_per_run=1, score_fn=fake,
+        )
+        self.assertEqual([j["jr"] for j in received["jobs"]], ["JR_NEW"])
+        self.assertEqual([j["jr"] for j in report["rankedJobs"]], ["JR_NEW"])
+        self.assertEqual(report["deferredScoreCount"], 1)
 
     def test_build_report_stamps_profile_hash(self):
         report = daily.build_report(
