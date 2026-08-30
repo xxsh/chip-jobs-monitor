@@ -699,6 +699,43 @@ class DailyTests(unittest.TestCase):
             daily.remove_latest_report_files = original_remove_latest_report_files
             daily.write_grouped = original_write_grouped
 
+    def test_main_raises_when_all_sources_fail(self):
+        original_enabled_sources = daily.enabled_sources
+        original_run_one_source = daily.run_one_source
+        original_acquire_run_lock = daily.acquire_run_lock
+        original_ensure_dir = daily.ensure_dir
+        original_remove_latest_report_files = daily.remove_latest_report_files
+        original_write_grouped = daily.write_grouped
+        attempted = []
+        released = []
+        written = []
+
+        def fake_run_one_source(source, seed=False):
+            attempted.append(source)
+            raise RuntimeError(f"{source} unavailable")
+
+        try:
+            daily.enabled_sources = lambda: ["nvidia", "amd"]
+            daily.run_one_source = fake_run_one_source
+            daily.acquire_run_lock = lambda: lambda: released.append(None)
+            daily.ensure_dir = lambda path: None
+            daily.remove_latest_report_files = lambda: None
+            daily.write_grouped = written.append
+
+            with self.assertRaisesRegex(RuntimeError, "all sources failed"):
+                daily.main()
+
+            self.assertEqual(attempted, ["nvidia", "amd"])
+            self.assertEqual(released, [None])
+            self.assertEqual(written, [])
+        finally:
+            daily.enabled_sources = original_enabled_sources
+            daily.run_one_source = original_run_one_source
+            daily.acquire_run_lock = original_acquire_run_lock
+            daily.ensure_dir = original_ensure_dir
+            daily.remove_latest_report_files = original_remove_latest_report_files
+            daily.write_grouped = original_write_grouped
+
     def test_persist_daily_run_requires_mysql(self):
         # MySQL is the ledger; an unconfigured environment must fail loudly rather
         # than silently skipping (the old behavior that let JSON-report dedup drift).
