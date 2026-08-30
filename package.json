@@ -13,7 +13,7 @@
     "db:verify": "python3 verify_db.py",
     "rescore:import": "python3 scripts/import-rescore-report.py",
     "daily:py": ".venv/bin/python daily.py",
-    "daily:test": "python3 -m unittest daily_test test_arm_source",
+    "daily:test": "python3 -m unittest daily_test test_arm_source fetch_test score_test",
     "test": "node --test"
   },
   "dependencies": {
