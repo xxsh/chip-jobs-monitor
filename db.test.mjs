@@ -12,6 +12,26 @@ import {
   toMysqlDate,
   toMysqlDateTime,
 } from './db.mjs';
+import { parseDatedSnapshot } from './scripts/backfill-db-helpers.mjs';
+
+test('parseDatedSnapshot defaults bare snapshot names to NVIDIA', () => {
+  assert.deepEqual(parseDatedSnapshot('2026-08-29_shanghai-china.json'), {
+    date: '2026-08-29',
+    source: 'nvidia',
+    slug: 'shanghai-china',
+    file: '2026-08-29_shanghai-china.json',
+  });
+});
+
+test('parseDatedSnapshot preserves an explicit source infix', () => {
+  assert.deepEqual(parseDatedSnapshot('2026-08-29_amd_shanghai-china.json'), {
+    date: '2026-08-29',
+    source: 'amd',
+    slug: 'shanghai-china',
+    file: '2026-08-29_amd_shanghai-china.json',
+  });
+  assert.equal(parseDatedSnapshot('latest_shanghai-china.json'), null);
+});
 
 test('mysqlConfigFromEnv skips persistence when no MySQL env vars exist', () => {
   const config = mysqlConfigFromEnv({});
