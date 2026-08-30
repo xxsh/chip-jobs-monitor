@@ -1229,7 +1229,7 @@ def main():
                     "error": str(error),
                 })
 
-        if not results:
+        if not any(result.get("status") == "ok" for result in results):
             raise RuntimeError("all sources failed")
 
         grouped = build_grouped(results)
