@@ -8,7 +8,10 @@ Run: python -m unittest fetch_test   (or: python fetch_test.py)
 
 import asyncio
 import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import fetch
 
@@ -79,6 +82,19 @@ class FetchAllTests(unittest.TestCase):
             asyncio.run(fetch.fetch_all(_FakeContext(page)))
 
         self.assertTrue(page.closed)
+
+
+class FindPreviousSnapshotTests(unittest.TestCase):
+    def test_dated_replay_ignores_later_snapshots(self):
+        suffix = f"_{fetch.slugify(fetch.LOCATION)}.json"
+        with tempfile.TemporaryDirectory() as snapshot_dir:
+            for label in ("2026-08-01", "2026-08-15", "2026-08-20", "2026-09-01"):
+                open(os.path.join(snapshot_dir, f"{label}{suffix}"), "w", encoding="utf-8").close()
+
+            with mock.patch.object(fetch, "SNAPSHOT_DIR", snapshot_dir):
+                previous = fetch.find_previous_snapshot_file("2026-08-15")
+
+        self.assertEqual(os.path.basename(previous), f"2026-08-01{suffix}")
 
 
 class ParseDescriptionSectionsTests(unittest.TestCase):
