@@ -461,54 +461,61 @@ async def create_context():
 
 async def fetch_all(ctx):
     page = await ctx.new_page()
+    try:
+        prime_url = f"https://jobs.nvidia.com/careers?location={quote(LOCATION, safe=_URI_SAFE)}&sort_by=timestamp"
+        await page.goto(prime_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2000)
 
-    prime_url = f"https://jobs.nvidia.com/careers?location={quote(LOCATION, safe=_URI_SAFE)}&sort_by=timestamp"
-    await page.goto(prime_url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2000)
+        all_positions = []
+        start = 0
+        step = 10
+        while True:
+            url = (
+                "https://jobs.nvidia.com/api/pcsx/search?domain=nvidia.com&query=&location="
+                f"{quote(LOCATION, safe=_URI_SAFE)}&start={start}&num={step}&sort_by=timestamp&"
+            )
+            res = await page.evaluate(
+                """async (targetUrl) => {
+                    const response = await fetch(targetUrl, { credentials: 'include', headers: { Accept: 'application/json' } });
+                    return { status: response.status, text: await response.text() };
+                }""",
+                url,
+            )
+            if res["status"] != 200:
+                message = f"NVIDIA search API returned HTTP {res['status']}: {res['text'][:200]}"
+                sys.stderr.write(f"ERR {message}\n")
+                raise RuntimeError(message)
+            payload = json.loads(res["text"])
+            data = payload.get("data") or {}
+            positions = data.get("positions") or []
+            reported_total = data.get("count") or 0
+            all_positions.extend(positions)
+            sys.stderr.write(f"  fetched {len(all_positions)}/{reported_total}\r")
+            sys.stderr.flush()
+            if len(positions) == 0:
+                if reported_total and start < reported_total:
+                    raise RuntimeError(f"NVIDIA search pagination ended early at {start}/{reported_total}")
+                break
+            start += len(positions)
+            if reported_total and start >= reported_total:
+                break
+            if start > 2000:
+                raise RuntimeError(
+                    f"NVIDIA search pagination exceeded the 2000-result safety limit "
+                    f"at {start}/{reported_total or 'unknown'}"
+                )
+        sys.stderr.write("\n")
 
-    all_positions = []
-    start = 0
-    step = 10
-    while True:
-        url = (
-            "https://jobs.nvidia.com/api/pcsx/search?domain=nvidia.com&query=&location="
-            f"{quote(LOCATION, safe=_URI_SAFE)}&start={start}&num={step}&sort_by=timestamp&"
-        )
-        res = await page.evaluate(
-            """async (targetUrl) => {
-                const response = await fetch(targetUrl, { credentials: 'include', headers: { Accept: 'application/json' } });
-                return { status: response.status, text: await response.text() };
-            }""",
-            url,
-        )
-        if res["status"] != 200:
-            sys.stderr.write(f"ERR status {res['status']} {res['text'][:200]}\n")
-            break
-        payload = json.loads(res["text"])
-        data = payload.get("data") or {}
-        positions = data.get("positions") or []
-        reported_total = data.get("count") or 0
-        all_positions.extend(positions)
-        sys.stderr.write(f"  fetched {len(all_positions)}/{reported_total}\r")
-        sys.stderr.flush()
-        if len(positions) == 0:
-            break
-        start += len(positions)
-        if reported_total and start >= reported_total:
-            break
-        if start > 2000:
-            break
-    sys.stderr.write("\n")
-
-    seen = set()
-    unique = []
-    for position in all_positions:
-        if position["id"] in seen:
-            continue
-        seen.add(position["id"])
-        unique.append(position)
-    await page.close()
-    return unique
+        seen = set()
+        unique = []
+        for position in all_positions:
+            if position["id"] in seen:
+                continue
+            seen.add(position["id"])
+            unique.append(position)
+        return unique
+    finally:
+        await page.close()
 
 
 async def fetch_job_detail_html(page, url):

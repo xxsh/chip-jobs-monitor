@@ -6,9 +6,79 @@ helpers import without a browser.
 Run: python -m unittest fetch_test   (or: python fetch_test.py)
 """
 
+import asyncio
+import json
 import unittest
 
 import fetch
+
+
+class _FakePage:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.closed = False
+
+    async def goto(self, *args, **kwargs):
+        return None
+
+    async def wait_for_timeout(self, *args):
+        return None
+
+    async def evaluate(self, *args):
+        return next(self.responses)
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeContext:
+    def __init__(self, page):
+        self.page = page
+
+    async def new_page(self):
+        return self.page
+
+
+def _search_response(positions, count):
+    return {"status": 200, "text": json.dumps({"data": {"positions": positions, "count": count}})}
+
+
+class FetchAllTests(unittest.TestCase):
+    def test_initial_non_200_response_raises_and_closes_page(self):
+        page = _FakePage(
+            [{"status": 503, "text": "temporarily unavailable"}]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            asyncio.run(fetch.fetch_all(_FakeContext(page)))
+
+        self.assertTrue(page.closed)
+
+    def test_mid_pagination_non_200_response_raises_and_closes_page(self):
+        page = _FakePage(
+            [
+                _search_response([{"id": "1"}], 2),
+                {"status": 503, "text": "temporarily unavailable"},
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            asyncio.run(fetch.fetch_all(_FakeContext(page)))
+
+        self.assertTrue(page.closed)
+
+    def test_premature_empty_page_raises_and_closes_page(self):
+        page = _FakePage(
+            [
+                _search_response([{"id": "1"}], 2),
+                _search_response([], 2),
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ended early at 1/2"):
+            asyncio.run(fetch.fetch_all(_FakeContext(page)))
+
+        self.assertTrue(page.closed)
 
 
 class ParseDescriptionSectionsTests(unittest.TestCase):
