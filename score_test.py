@@ -59,6 +59,18 @@ class JobPayloadTests(unittest.TestCase):
         self.assertIn("- 12+ years infra", prompt)
         self.assertIn("- 5+ years ML infra", prompt)
 
+    def test_full_description_preserves_requirements_after_6000_characters(self):
+        tail_requirement = "TAIL_CORE_REQUIREMENT: production ROCm cluster operations"
+        job = {
+            "title": "GPU Infrastructure Engineer",
+            "jr": "JR-LONG",
+            "description": "A" * 6001 + "\n" + tail_requirement,
+        }
+
+        prompt = _job_payload(job, {})
+
+        self.assertIn(tail_requirement, prompt)
+
 
 class PromptProcedureTests(unittest.TestCase):
     def test_prompt_drives_requirement_first_reasoning(self):
