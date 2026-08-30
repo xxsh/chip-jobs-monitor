@@ -98,7 +98,7 @@ def find_previous_snapshot_file(current_label=None):
             continue
         if is_date_label(current_label):
             label = fn[: -len(suffix)]
-            if not is_date_label(label):
+            if not is_date_label(label) or label > current_label:
                 continue
         files.append(fn)
     files.sort()
