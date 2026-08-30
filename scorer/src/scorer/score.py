@@ -116,7 +116,7 @@ def _job_payload(job: dict[str, Any], profile: dict[str, Any]) -> str:
         employment_type=job.get("employmentType") or "(unknown)",
         posted=job.get("datePosted") or "(unknown)",
         link=job.get("link") or "(unknown)",
-        description=(job.get("description") or job.get("summary") or "(no description)")[:6000],
+        description=job.get("description") or job.get("summary") or "(no description)",
         responsibilities=_format_list(job.get("responsibilities")),
         requirements=_format_list(job.get("requirements")),
         preferred=_format_list(job.get("preferred")),
