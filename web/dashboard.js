@@ -9,12 +9,15 @@ const rolesBodyEl = document.querySelector('#rolesBody');
 const roleCompanyEl = document.querySelector('#roleCompany');
 const roleFitEl = document.querySelector('#roleFit');
 const roleSortEl = document.querySelector('#roleSort');
+const roleApplicationEl = document.querySelector('#roleApplication');
 const roleSearchEl = document.querySelector('#roleSearch');
 const roleCountEl = document.querySelector('#roleCount');
 const chartTipEl = document.querySelector('#chartTip');
 const topRolesEl = document.querySelector('#topRoles');
 const recentAddsEl = document.querySelector('#recentAdds');
 const recentCancelsEl = document.querySelector('#recentCancels');
+const applicationsBodyEl = document.querySelector('#applicationsBody');
+const applicationCountEl = document.querySelector('#applicationCount');
 
 let allRoles = [];
 
@@ -272,6 +275,31 @@ function statusPill(row) {
   return `<span class="status-pill ${status}">${status}</span>`;
 }
 
+function applicationPill(row) {
+  if (!row.applicationStatus) return '';
+  const label = row.applicationStatus === 'declined' ? 'Declined' : row.applicationStatus;
+  const cssClass = row.applicationStatus === 'declined' ? ' declined' : '';
+  return `<span class="application-pill${cssClass}">${escapeHtml(label)}</span>`;
+}
+
+function applicationDetails(row) {
+  if (!row.applicationStatus) return '<span class="role-dept">No record</span>';
+  return `${applicationPill(row)}<span class="role-dept">Applied ${escapeHtml(row.applicationSubmittedDate)}</span>`;
+}
+
+function renderApplicationHistory(applications) {
+  applicationCountEl.textContent = `${applications.length} records`;
+  applicationsBodyEl.innerHTML = applications.map((row) => `
+    <tr>
+      <td>${sourcePill(row)}</td>
+      <td>${escapeHtml(row.title)}</td>
+      <td class="mono">${escapeHtml(row.jr)}</td>
+      <td class="mono">${escapeHtml(row.applicationSubmittedDate)}</td>
+      <td>${applicationPill(row)}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="5" class="empty">No application history recorded</td></tr>';
+}
+
 const FIT_ORDER = { 'Strong fit': 0, 'Good fit': 1, 'Possible stretch': 2, 'Low fit': 3 };
 
 function recClass(rec) {
@@ -309,6 +337,7 @@ function renderTopRoles(roles) {
       <div class="meta">
         ${sourcePill(role)}
         ${statusPill(role)}
+        ${role.applicationStatus ? applicationDetails(role) : ''}
         <span class="pill ${suitabilityClass(role.suitability)}">${escapeHtml(role.score)} · ${escapeHtml(role.suitability)}</span>
         ${scoreSourcePill(role)}
         ${scoreDeltaPill(role)}
@@ -323,12 +352,15 @@ function renderRolesTable() {
   const company = roleCompanyEl.value;
   const fit = roleFitEl.value;
   const sort = roleSortEl.value;
+  const applicationStatus = roleApplicationEl.value;
   const query = roleSearchEl.value.trim().toLowerCase();
 
   const rows = allRoles
     .filter((role) => {
       if (company && role.source !== company) return false;
       if (fit && role.suitability !== fit) return false;
+      if (applicationStatus === 'unrecorded' && role.applicationStatus) return false;
+      if (applicationStatus && applicationStatus !== 'unrecorded' && role.applicationStatus !== applicationStatus) return false;
       if (query) {
         const hay = `${role.title || ''} ${role.jr || ''} ${role.department || ''}`.toLowerCase();
         if (!hay.includes(query)) return false;
@@ -358,18 +390,19 @@ function renderRolesTable() {
         ${role.department ? `<span class="role-dept">${escapeHtml(role.department)}</span>` : ''}
       </td>
       <td><span class="rec ${recClass(role.recommendation)}">${escapeHtml(role.recommendation || '—')}</span></td>
+      <td>${applicationDetails(role)}</td>
       <td class="num">${deltaCell(role)}</td>
       <td class="mono">${escapeHtml(role.jr || '—')}</td>
       <td class="mono">${escapeHtml(role.date || '—')}</td>
     </tr>
-  `).join('') || '<tr><td colspan="8" class="empty">No roles match these filters</td></tr>';
+  `).join('') || '<tr><td colspan="9" class="empty">No roles match these filters</td></tr>';
 }
 
 function setupRolesControls(sources) {
   roleCompanyEl.innerHTML = ['<option value="">All companies</option>']
     .concat((sources || []).map((s) => `<option value="${escapeHtml(s.source)}">${escapeHtml(s.display)}</option>`))
     .join('');
-  for (const el of [roleCompanyEl, roleFitEl, roleSortEl]) el.onchange = renderRolesTable;
+  for (const el of [roleCompanyEl, roleFitEl, roleSortEl, roleApplicationEl]) el.onchange = renderRolesTable;
   roleSearchEl.oninput = renderRolesTable;
 }
 
@@ -408,6 +441,7 @@ function renderChanges(el, rows, { linked = false } = {}) {
         : `<span class="change-title">${escapeHtml(row.title)}</span>`}
       <div class="meta">
         ${sourcePill(row)}
+        ${applicationPill(row)}
         <span>${escapeHtml(row.date)}</span>
         <span>${escapeHtml(row.jr || 'no JR')}</span>
         ${row.department ? `<span>${escapeHtml(row.department)}</span>` : ''}
@@ -432,6 +466,7 @@ async function loadDashboard() {
     renderSourceChart(data.sources || []);
     renderFitChart(data.fitSeries || []);
     allRoles = data.roles || [];
+    renderApplicationHistory(data.applicationHistory || []);
     renderTopRoles(allRoles);
     setupRolesControls(data.sources || []);
     renderRolesTable();

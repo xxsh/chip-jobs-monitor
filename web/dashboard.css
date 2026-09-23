@@ -479,6 +479,24 @@ svg {
   background: var(--red);
 }
 
+.application-pill {
+  display: inline-flex;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--ink);
+  background: var(--paper-2);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.application-pill.declined {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(211, 53, 47, 0.06);
+}
+
 .pill.strong {
   background: var(--green);
 }

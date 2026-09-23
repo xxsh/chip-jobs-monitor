@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { createMysqlConnectionFromEnv } from '../db.mjs';
+import { attachApplications, queryApplicationHistory } from './application-history.mjs';
 
 const MODULE_PATH = fileURLToPath(import.meta.url);
 const ROOT = path.dirname(path.dirname(MODULE_PATH));
@@ -439,6 +440,7 @@ async function queryTrends() {
     const activeJobs = sources.reduce((sum, row) => sum + numberValue(row.activeJobs), 0);
     const activeDelta = sources.reduce((sum, row) => sum + numberValue(row.activeDelta), 0);
     const bestScore = Math.max(0, ...sources.map((row) => numberValue(row.bestScore))) || null;
+    const applicationHistory = await queryApplicationHistory(connection);
 
     return {
       generatedAt: new Date().toISOString(),
@@ -467,9 +469,10 @@ async function queryTrends() {
       runs: movementSeries,
       runsBySource: Object.fromEntries(groupBySource(runs)),
       fitSeries: buildFitSeries(fitRows),
-      roles: decorateRows(roles),
-      recentAdds: decorateRows(recentAdds),
-      recentCancels: decorateRows(recentCancels),
+      roles: decorateRows(attachApplications(roles, applicationHistory)),
+      recentAdds: decorateRows(attachApplications(recentAdds, applicationHistory)),
+      recentCancels: decorateRows(attachApplications(recentCancels, applicationHistory)),
+      applicationHistory: decorateRows(applicationHistory),
     };
   } finally {
     await connection.end();
