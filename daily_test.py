@@ -6,6 +6,8 @@ Run: python -m unittest daily_test   (or: python daily_test.py)
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, call, patch
 
 import db
 import daily
@@ -766,6 +768,55 @@ class DailyTests(unittest.TestCase):
         )
         self.assertRegex(md, r"## Canceled")
         self.assertRegex(md, r"\[JR-X\] Removed role — https://x/removed")
+
+
+class FetchRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.fetch_main = AsyncMock()
+        self.sleep = self.enterContext(patch("time.sleep"))
+        self.enterContext(patch.dict(sys.modules, {"fetch": SimpleNamespace(main=self.fetch_main)}))
+        self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.enterContext(patch("sys.stderr"))
+
+    def test_transient_outage_can_recover_on_fifth_attempt(self):
+        self.fetch_main.side_effect = [RuntimeError("net::ERR_CONNECTION_CLOSED")] * 4 + [None]
+
+        daily.run_fetch()
+
+        self.assertEqual(self.fetch_main.await_count, 5)
+        self.assertEqual(self.sleep.call_args_list, [call(5), call(10), call(15), call(20)])
+
+    def test_exhausted_default_or_configured_budget_raises(self):
+        for configured, expected in [(None, 5), ("2", 2), ("0", 1)]:
+            with self.subTest(configured=configured):
+                self.fetch_main.reset_mock()
+                self.sleep.reset_mock()
+                if configured is None:
+                    os.environ.pop("NVIDIA_FETCH_ATTEMPTS", None)
+                else:
+                    os.environ["NVIDIA_FETCH_ATTEMPTS"] = configured
+                self.fetch_main.side_effect = RuntimeError("net::ERR_CONNECTION_CLOSED")
+
+                with self.assertRaisesRegex(RuntimeError, "ERR_CONNECTION_CLOSED"):
+                    daily.run_fetch()
+
+                self.assertEqual(self.fetch_main.await_count, expected)
+                self.assertEqual(self.sleep.call_count, expected - 1)
+
+    def test_nontransient_error_fails_without_retry(self):
+        self.fetch_main.side_effect = RuntimeError("incomplete NVIDIA search results")
+
+        with self.assertRaisesRegex(RuntimeError, "incomplete NVIDIA search results"):
+            daily.run_fetch()
+
+        self.fetch_main.assert_awaited_once()
+        self.sleep.assert_not_called()
+
+    def test_success_returns_without_retry(self):
+        daily.run_fetch()
+
+        self.fetch_main.assert_awaited_once()
+        self.sleep.assert_not_called()
 
 
 if __name__ == "__main__":

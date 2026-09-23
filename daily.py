@@ -870,7 +870,8 @@ def run_fetch():
         "Timeout",
         "net::ERR",
     )
-    attempts = max(1, int(os.environ.get("NVIDIA_FETCH_ATTEMPTS", "3")))
+    # Allow a longer recovery window for short Chromium connection outages.
+    attempts = max(1, int(os.environ.get("NVIDIA_FETCH_ATTEMPTS", "5")))
     for attempt in range(1, attempts + 1):
         try:
             asyncio.run(fetch.main())
