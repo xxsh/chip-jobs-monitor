@@ -84,6 +84,11 @@
               <option value="delta">Sort: score Δ</option>
               <option value="date">Sort: date</option>
             </select>
+            <select id="roleApplication" aria-label="Filter by application status">
+              <option value="">All application statuses</option>
+              <option value="unrecorded">No recorded application</option>
+              <option value="declined">Declined</option>
+            </select>
             <input id="roleSearch" type="search" placeholder="search title / JR / dept…" aria-label="Search roles">
             <span id="roleCount" class="roles-count"></span>
           </div>
@@ -97,12 +102,34 @@
                 <th>Fit</th>
                 <th>Role</th>
                 <th>Rec</th>
+                <th>Application</th>
                 <th class="num">Δ score</th>
                 <th>JR</th>
                 <th>First seen</th>
               </tr>
             </thead>
             <tbody id="rolesBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel panel-roles-full" id="applicationHistory" aria-label="Application history">
+        <div class="panel-head">
+          <h2>Application history</h2>
+          <span id="applicationCount"></span>
+        </div>
+        <div class="roles-table-wrap">
+          <table class="roles-table">
+            <thead>
+              <tr>
+                <th>Company</th>
+                <th>Role at application</th>
+                <th>JR</th>
+                <th>Date submitted</th>
+                <th>Application status</th>
+              </tr>
+            </thead>
+            <tbody id="applicationsBody"></tbody>
           </table>
         </div>
       </section>

@@ -149,6 +149,18 @@ CREATE TABLE IF NOT EXISTS resume_scores (
   CONSTRAINT fk_resume_scores_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Application outcomes belong to a requisition, even after its job listing disappears.
+CREATE TABLE IF NOT EXISTS job_applications (
+  source VARCHAR(64) NOT NULL,
+  jr VARCHAR(64) NOT NULL,
+  submitted_date DATE NOT NULL,
+  title VARCHAR(512) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (source, jr, submitted_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS cancellations (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   run_id BIGINT UNSIGNED NOT NULL,
